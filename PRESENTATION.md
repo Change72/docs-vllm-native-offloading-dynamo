@@ -4,23 +4,27 @@
 
 ## TL;DR (Executive Summary)
 
-**Problem.** vLLM's native CPU offload (`OffloadingConnector`) emits KV-cache events that Dynamo's KV router silently drops or misclassifies. As a result, Dynamo cannot see what each worker has in its CPU tier, makes blind routing decisions, and wastes prefill compute on prefixes that *are* cached — they're just on a worker the router doesn't know to pick.
+**Problem.** vLLM's native CPU offload (`OffloadingConnector`) emits KV-cache events that Dynamo's KV router silently drops or misclassifies. As a result, Dynamo cannot see what each worker has in its CPU tier, makes blind routing decisions, and wastes prefill compute on prefixes that *are* cached — they're just on a worker but the router doesn't know.
 
 **Root cause** is in three layers (full diagnosis in §2):
 1. **[Easy]** Medium-name mismatch (`"CPU"` vs `"CPU_PINNED"`) → events fall into the Device tier as default
 2. **[Complex]** Connector emits BlockStored events without `token_ids` / `block_size` / `parent_block_hash` → Dynamo cannot rebuild its radix tree → silent drop
 3. **[Next phase]** When vLLM's *group offload* mode is enabled (`block_size_factor > 1`), a single offload event covers multiple GPU blocks under a single hash → Dynamo cannot align its block-level index. Disabled by default in vLLM; **explicitly out of scope for this work**, scheduled as a follow-up.
 
-**Solution.** Three commits land the payload that Dynamo needs and an alias the router recognizes:
+**Solution.**
 * vLLM `e074f0a` — populate full `BlockStored` payload from a side-table in `OffloadingConnectorScheduler`
 * Dynamo `6c2a73a` — accept `"CPU"` as an alias for the `HostPinned` tier
 * Dynamo `5b7725f` — plumb `kv_cache_events_applied` counters into the lower-tier indexer so the new CPU-tier traffic is observable on Prometheus
 
-The diff against `llm-d`'s "extra table on the router side" approach is in §3.
+**Headline result** at production saturation; **3 cold-start repeats, mean ± std**.
 
-**Discovery during validation.** Wiring up CPU tier visibility is *necessary but not sufficient*. The router's default cost-function constants (`host_cache_hit_weight = 0.75`, `prefill_load_scale = 1.0`) actively under-value CPU hits and over-value load balance — leaving 25 pp of compute on the table. Surfacing them as CLI flags / env vars (with backward-compatible defaults) closes the gap.
+*Hardware:* 8× B200 (single node, 192 GB HBM per GPU), 1 GPU per worker (TP=1), `gpu_memory_utilization=0.5` (≈ 96 GB allocated per engine; after Qwen3-32B bf16 weights + activations, **≈ 26 GB usable for device KV per worker** = 100 K tokens, intentionally tight to make the CPU tier matter), `cpu_bytes_to_use = 150 GiB` per worker (600 K tokens of CPU-tier KV per worker).
 
-**Headline result** at production saturation (long-context multi-turn, c=128 on 8× B200, Qwen3-32B; **3 cold-start repeats, mean ± std**):
+*Model:* Qwen/Qwen3-32B, BF16, `max_model_len=40960`.
+
+*Workload (`generate_multi_turn_longbench.json`):* multi-turn chat from vLLM's `benchmark_serving_multi_turn.py`, 128 conversations, **`prefix_num_tokens = 15 000` per conversation (constant, hot-warming sample)**, `num_turns ∈ uniform[30, 50]` (~40 mean), per-turn user msg ∈ uniform[60, 80] tokens, generation length ∈ uniform[40, 60] tokens. **Effective ISL grows over turns** (history accumulates): turn 1 ≈ 15.1 K tokens → turn 40 ≈ 19.8 K → turn 50 ≈ 21 K. **OSL ≈ 50** tokens/turn. **No common prefix across conversations** (each conversation has its own 15 K prefix from `pg1184.txt`/`pg2600.txt`/`pg10.txt`), so cache reuse comes purely from sticking each conversation's later turns onto the worker that already prefilled its earlier turns — *not* from a shared system prompt.
+
+*Concurrency:* `num_clients = max_active_conversations = 128`, `request_rate = 0.5 req/s/client`.
 
 | Metric | Baseline (no patches) | **Best (this work)** | Delta |
 |---|---|---|---|
@@ -30,16 +34,14 @@ The diff against `llm-d`'s "extra table on the router side" approach is in §3.
 | Wasted prompt-token compute | 71.83 ± 0.17 % | **7.60 ± 0.16 %** | **−64.2 pp** |
 | Overall cache hit (token-weighted) | 28 % | **92 %** | **+64 pp** |
 
-The same pattern holds across concurrency 8 → 384 (§6.3, §6.9 ceiling), request rate 0.1 → 4.0 (§6.7), conversation prefix 5 K → 30 K (§6.5), and on the LMCache team's own `LMBenchmark` workload (§6.6). The gap is **69 % mechanism-driven and 31 % cache cold-start advantage** (§6.8 pre-warm ablation — directly addresses Harry Xie's reviewer concern).
+The same pattern holds across concurrency 8 → 384 (§6.3, §6.9 ceiling), request rate 0.1 → 4.0 (§6.7), conversation prefix 5 K → 30 K (§6.5), on the LMCache team's own `LMBenchmark` workload (§6.6), and §6.8 pre-warm ablation.
 
-**Recommended upstream defaults** based on the (h × pl) sweep in §6.4:
+**Recommended settings** based on the (h × pl) sweep in §6.4:
 
 ```
 host_cache_hit_weight = 1.0   # currently hardcoded 0.75
 prefill_load_scale    = 10    # currently hardcoded 1.0; 100 is best but extreme
 ```
-
-These two changes are roughly 99 % of the practical gain and unlikely to regress any current workload, because they only matter when the lower-tier indexer is non-empty (and today, it almost always is empty without our fix).
 
 ![Headline progression](images/headline_progression.png)
 
@@ -57,7 +59,7 @@ For long-context multi-turn workloads (chatbots, agents, code assistants), prefi
 
 GPU memory is too small to hold every user's history for a 32B+ model. With `gpu_memory_utilization=0.50` on a B200 (192 GB), roughly 26 GB remains for KV after model weights — about 108 K tokens, or 5–8 conversations worth of cumulative state. Anything beyond that has to live somewhere else.
 
-vLLM's `OffloadingConnector` provides that "somewhere else" — a host-pinned CPU buffer (default 60 GiB, often configured to 150 GiB) that absorbs evictions from the GPU KV pool and serves them back when the prefix is needed again. The mechanics are well-defined inside vLLM.
+vLLM's `OffloadingConnector` provides that "somewhere else" — a host-pinned CPU buffer (configured to 150 GiB) that absorbs evictions from the GPU KV pool and serves them back when the prefix is needed again. The mechanics are well-defined inside vLLM.
 
 The gap is at the *cluster* layer. Dynamo's KV-aware router decides which of N workers should serve an incoming request, scoring each worker by how much of the request's prefix is already cached there. That scoring needs accurate per-worker, per-tier state. When the CPU tier is invisible to the router — which we are about to show is the default state today — the router has to assume a worker's prefix is gone the moment GPU evicts it, even though the worker would happily reload from its own CPU buffer.
 
@@ -89,6 +91,8 @@ Connector-tier events follow a different path. The `OffloadingConnectorScheduler
 
 ### 1.3 Event timeline
 
+**`OffloadingConnector` is *write-through*, not write-back.** As soon as a GPU block completes (turns into a full, hashable `KVCacheBlock`), the connector issues an *immediate* asynchronous device → host memcpy and registers the CPU-side copy with its own block manager. The CPU copy is not deferred until GPU pressure — it starts populating in parallel. After the memcpy completes (k steps later), the block is *simultaneously* resident in both tiers, and stays that way until each tier independently decides to evict it.
+
 ```
   step:           S          S+1                    S+k                          S+M           S+P
                   │           │                      │                            │             │
@@ -100,7 +104,7 @@ Connector-tier events follow a different path. The `OffloadingConnectorScheduler
                                ← k = memcpy duration →
 ```
 
-The CPU `BlockStored` lags the GPU one by the memcpy duration. CPU eviction (`BlockRemoved`) can happen much later, when the offload bucket pressure forces it out. The two streams overlap but neither is a subset of the other — both are needed for a router to know whether a block X is currently retrievable from worker W's CPU tier.
+The GPU event fires at step `S+1` (right when the block is sealed). The CPU event fires `k` steps later — `k` is the wall-clock time of the device-to-host memcpy on the offload stream, not a function of pressure or eviction. The two tiers then evict independently: GPU usually first (small budget, hot churn), CPU later (large budget, slower turnover).
 
 ---
 
@@ -108,13 +112,9 @@ The CPU `BlockStored` lags the GPU one by the memcpy duration. CPU eviction (`Bl
 
 ### 2.1 Issue 1 — Medium-name mismatch  *[Easy to fix]*
 
-vLLM's `CPULoadStoreSpec.medium()` returns the bare string `"CPU"`.
+vLLM's `CPULoadStoreSpec.medium()` returns the bare string `"CPU"`. Mooncake's workers emit `"cpu"`.
 
-Dynamo's `StorageTier::from_kv_medium` (Rust, in `lib/kv-router/src/protocols.rs`) only recognizes `"CPU_PINNED"` and `"CPU_TIER1"`. Unrecognized media fall through to the default branch which routes the event into the *Device* (GPU) tier indexer.
-
-**Effect.** Even when the payload is otherwise fine, every CPU offload event silently pollutes the GPU index instead of the host-pinned index. The router's notion of "what is on worker W's GPU" becomes a mixture of real GPU blocks and ghost CPU blocks, while its notion of "what is on worker W's CPU" stays empty.
-
-> (As a data point: Mooncake's workers emit `"cpu"` lowercase, which is a third spelling. Two aliases are worth normalizing — `"CPU"` and `"cpu"` — even if we only fix our own case here.)
+Dynamo's `StorageTier::from_kv_medium` (Rust, in `lib/kv-router/src/protocols.rs`) only recognizes `"CPU_PINNED"` and `"CPU_TIER1"`. Unrecognized media fall through to the default branch which routes the event into the *Device* (GPU) tier indexer. Then `block_size=0`, the Device indexer **also** silently drops the event at `lib/kv-router/src/zmq_wire/convert.rs:181` when it tries to rebuild a `LocalBlockHash` and finds nothing to hash.
 
 ### 2.2 Issue 2 — Missing payload fields  *[Complex but addressable]*
 
@@ -149,9 +149,9 @@ vLLM has an optional optimization where the `OffloadingSpec` can use a `block_si
 * the event uses the **last** GPU block's hash as its key
 * GPU-side events still come at GPU-block granularity
 
-Dynamo's radix tree is at GPU-block granularity. Without expansion logic on the connector side, a single chunk event lands as a single radix node spanning `F × block_size` tokens — and none of the intermediate prefix matches anything else in the tree.
+Dynamo's radix tree is at GPU-block granularity. Without expansion logic on the connector side, a single chunk event lands as a single radix node spanning `F × block_size` tokens — and none of the intermediate prefix matches anything else in the tree. *[llm-d also suffers from this.]*
 
-**Status.** Group offloading is **disabled by default** in vLLM today. This work targets the common `factor == 1` path and explicitly preserves the placeholder fallback for `factor > 1` (i.e., we don't regress; we just don't help yet). Production users who enable group offload to optimize I/O will need a follow-up that expands one chunk event into `F` block-granularity events with a correct parent chain — and the reverse for `BlockRemoved`. **This is the next phase of the work**, planned as a follow-up patch on the connector.
+**Status.** Group offloading is **disabled by default** in vLLM today. This work targets the common `factor == 1` path and explicitly preserves the placeholder fallback for `factor > 1`. **This is the next phase of the work**, planned as a follow-up patch on the connector.
 
 ---
 
@@ -274,7 +274,7 @@ We deployed the treatment image (`baseline + 3 commits`) on 8× B200, ran our `l
 | Wasted compute | 54.5 % | 37.0 % | −17.5 pp |
 | Overall cache hit | 45.5 % | 63.0 % | +17.5 pp |
 
-The commits clearly do something. But they leave a **25 percentage-point gap between treatment and the theoretical perfect router** (≈ 13 %, the unavoidable cost of first-time prefix prefill across 128 unique conversations). For a clean win we need to close that gap. Read on.
+The commits clearly do something. But they leave a **25 percentage-point gap between treatment and the theoretical perfect router** (≈ 13 %, the unavoidable cost of first-time prefix prefill across 128 unique conversations). 
 
 ---
 
@@ -318,18 +318,6 @@ With `prefill_load_scale = 100`, one missing block costs 100 logit units and one
 
 This sounds extreme but in practice **load balancing in a cache-rich workload is a self-defeating goal**: routing to a less-loaded worker that has no cache causes that worker to do an expensive prefill, which raises its load. Routing to a more-loaded worker that has the cache is *cheaper* because the prefill is short. Cache affinity is load balance, just on a longer time horizon.
 
-### 5.4 Surfacing these as CLI flags
-
-Both constants are now first-class CLI / env vars on the tunable image, with the existing defaults preserved exactly:
-
-| Flag | Env var | Default | Range |
-|---|---|---|---|
-| `--router-host-cache-hit-weight` | `DYN_ROUTER_HOST_CACHE_HIT_WEIGHT` | `0.75` | `[0.0, 1.0]` |
-| `--router-disk-cache-hit-weight` | `DYN_ROUTER_DISK_CACHE_HIT_WEIGHT` | `0.25` | `[0.0, 1.0]` |
-| `--router-prefill-load-scale` | `DYN_ROUTER_PREFILL_LOAD_SCALE` | `1.0` | `(0, +∞)` |
-
-Validation that the CLI path is byte-for-byte identical to the hardcoded path: we built two images differing only in *how* the constants are set — `demo-20260529-w10-pl100` (hardcoded defaults changed) vs `demo-20260530-tunable` (defaults unchanged, CLI flag passed). Running the long-bench workload under both produced metrics within 0.5 pp on every column — proving the CLI path is a pure refactor and the change can land with `--no-router-host-cache-hit-weight` (i.e., the default) without any behavior change for existing deployments.
-
 ---
 
 ## 6. Comprehensive benchmark sweep
@@ -343,13 +331,13 @@ Validation that the CLI path is byte-for-byte identical to the hardcoded path: w
 | **CPU offload bucket** | 150 GiB per worker (`cpu_bytes_to_use=161 GB`), pod memory limit 300 GiB |
 | **vLLM** | 0.21.0, `--enforce-eager`, `OffloadingConnector`, ZMQ KV events |
 | **Dynamo Frontend** | this fork, `--router-mode kv`, `--router-reset-states` |
-| **Workload generator** | vLLM `multi_turn/benchmark_serving_multi_turn.py` with our `--send-conversation-id=False` patch (compat with Dynamo's strict OpenAI schema validation) |
-| **Default workload** | "long-bench": 128 conv × 30–50 turns × `conv_prefix=15K` constant × per-turn `(60–80)` input / `(40–60)` output × `request-rate=0.5` per client |
+| **Workload generator** | vLLM `multi_turn/benchmark_serving_multi_turn.py` |
+| **Default workload** | "long-bench" (`workloads/generate_multi_turn_longbench.json`): **128 conversations**, **`conv_prefix = 15 K` constant per-conversation** (no common prefix shared across conversations — each conversation gets its own 15 K excerpt from `pg1184.txt`/`pg2600.txt`/`pg10.txt`), **`num_turns ∈ uniform[30, 50]`** (~40 mean), per-turn input ∈ `uniform[60, 80]` tokens, per-turn output ∈ `uniform[40, 60]` tokens (**OSL ≈ 50**). **Effective ISL grows over turns** as chat history accumulates: **turn 1 ≈ 15.1 K, turn 40 ≈ 19.8 K, turn 50 ≈ 21 K**. `request_rate = 0.5 req/s/client`. Cache reuse comes purely from re-sticking each conversation's later turns to the worker that prefilled its earlier turns — *not* from any shared system prompt. |
 | **Orchestration** | dedicated `sweep-orchestrator` Pod with SA-mounted `kubectl`, runs an offline sequencing script that cold-restarts the DGD for each cycle, drives the bench, dumps Prometheus metrics for all 8 workers and the frontend, and writes a single `_summary.csv` row per cycle |
 
 A total of **41 benchmark cycles** ran end-to-end across six dimensions (Ablation, Concurrency, h × pl heatmap, Workload size, LMBench cross-validation, Request rate). All raw artifacts (`bench.log`, per-worker metrics, frontend metrics) are checked in under `results/sweep-master-20260530T182821Z/`.
 
-### 6.2 Headline: ablation matrix  *(`Tier 1`, long-bench, c=64, rr=0.5)*
+### 6.2 Headline: ablation matrix  *(long-bench, c=64, rr=0.5)*
 
 ![T1 compute ablation](images/t1_compute_ablation.png)
 
@@ -372,7 +360,7 @@ A total of **41 benchmark cycles** ran end-to-end across six dimensions (Ablatio
 
 The 2-pp delta between rows 1 and 2 is the answer to the reviewer question *"Could you have gotten the same win by tuning the cost function on the upstream image, without your commits?"* No — without the commits, the router never sees the CPU tier no matter what weight you give it.
 
-### 6.3 Concurrency scaling  *(`Tier 2`, long-bench, rr=0.5)*
+### 6.3 Concurrency scaling  *(long-bench, rr=0.5)*
 
 ![T2 concurrency](images/t2_concurrency.png)
 
@@ -437,7 +425,7 @@ Single-shot benchmark numbers at this scale invite "is this real?" questioning. 
 
 > **Std devs are tiny — all < 1.5 pp for compute %, all < 0.5 rps for throughput.** Sample size 3 is small but the inter-run variance is negligible compared to inter-cohort differences. Confidence in the 4-line ordering: best vs baseline compute % gap is **64.23 pp** with combined uncertainty σ ≈ 0.24 → **p ≪ 0.001**. The ordering is reproducible. The numbers are not artifacts of a single fortunate run.
 
-### 6.4 (h × pl) heatmap  *(`Tier 3`, long-bench, c=64, rr=0.5)*
+### 6.4 (h × pl) heatmap  *(long-bench, c=64, rr=0.5)*
 
 ![T3 heatmap](images/t3_heatmap.png)
 
@@ -455,7 +443,7 @@ To pin down where the knee actually lives, we ran a denser sweep at h=1.0 over p
 >
 > **Implication for the upstream PR:** recommend `pl = 10` as the new default. This is **97 % of the benefit of pl=100** with a much milder change to the existing default (`pl = 1.0`), making it easier to land without invasive default-changing arguments.
 
-### 6.5 Workload size  *(`Tier 4`, c=64, rr=0.5, varying `conv_prefix`)*
+### 6.5 Workload size  *(c=64, rr=0.5, varying `conv_prefix`)*
 
 ![T4 prefix](images/t4_prefix.png)
 
@@ -477,7 +465,7 @@ To pin down where the knee actually lives, we ran a denser sweep at h=1.0 over p
 
 *(40K was attempted but the bench's "num_conv ≥ num_clients" check requires at least 64 conversations, and 64×40K = 2.56 M tokens butts up against the pg-corpus's 2.6 M ceiling. Not a system limitation; just a bench-generator artifact. The 30K row is already past the saturation cliff for baseline.)*
 
-### 6.6 Cross-benchmark validation: LMBench  *(`Tier 5`, NUM_USERS=64)*
+### 6.6 Cross-benchmark validation: LMBench  *(NUM_USERS=64)*
 
 We picked LMBench (the LMCache team's `synthetic-multi-round-qa`) because it's the bench that the upstream LMCache ecosystem actually publishes numbers against. We ran it against our server with the same image variants. Their bench uses different output keys, different workload shape (constant-content "hi hi hi" prefix instead of pg-corpus, longer per-user history), and is implemented in pure Python.
 
@@ -519,7 +507,7 @@ We ran the full LMBench QPS sweep ∈ {1, 4, 8, 16, 32, 64}, **all four cohorts*
 
 **The improvement transfers cleanly across benchmark frameworks, the 4-line decomposition holds across both benches, and the throughput-vs-tail-latency trade-off becomes a recognized tunable rather than a bug.** This closes the "you tuned for your own bench" and "it's actually just the cost-fn tuning" lines of attack, and adds a third dimension to the upstream story.
 
-### 6.7 Request-rate sensitivity  *(`Tier 6`, c=64, varying request rate per client, 7 rr points, 4-line)*
+### 6.7 Request-rate sensitivity  *(c=64, varying request rate per client, 7 rr points, 4-line)*
 
 ![T6 rr](images/t6_rr.png)
 
@@ -615,89 +603,4 @@ For our long-bench (128 conv × 15K conv_prefix), the unavoidable compute is:
 
 Of the ~27 M total prompt tokens processed in the run, that's ~7.4 % of unavoidable work. The best image's measured 6.8 % is within noise of this theoretical floor — it is **as good as routing can possibly do** for this workload, modulo first-prefill cost.
 
----
 
-## 7. Discussion
-
-### 7.1 Why this matters for Dynamo production deployments
-
-The default Dynamo deployment today gives the impression of working — it routes, returns answers, reports metrics. Nothing crashes. But for any deployment that enables CPU offload, the router is essentially blind to one of its two storage tiers, and the load-balance term in the cost function is actively making cache affinity worse. We measured the cost of this at >60 percentage points of avoidable compute under saturation, which is roughly 3× the cost of the model itself.
-
-The three commits + two CLI tunings are *strictly improvements*: they have no effect when the lower-tier indexer is empty (which is the legacy state without the connector patch), so deployments that aren't using CPU offload are unaffected. With the patches, every CPU offload byte the worker writes gets credited to the right tier, the right worker, and the right routing decision.
-
-### 7.2 Caveats and out-of-scope
-
-| Item | Status |
-|---|---|
-| Group / chunk offload (`block_size_factor > 1`) | **Next phase.** Disabled by default in vLLM today. Will need both directions (`BlockStored` expanded into F per-block events, `BlockRemoved` likewise). The connector-side approach makes this clean to implement; the router-side approach (`llm-d`) hits a parent-chain reconstruction problem. |
-| `h > 1.0` rejection | Rust range validator restricts to [0,1]. Probably overly conservative — but `pl` is the dominant lever so this isn't blocking. |
-| `c=192` text-budget failures | Bench corpus has 2.6 M tokens; 200 conv × 15 K prefix = 3 M tokens. Not a system issue. Mitigated by reducing prefix size or extending the corpus. |
-| `h=1.25` row of heatmap | Same range-validator issue. Out of scope. |
-| Multi-tenant LoRA workloads | Currently untested. The vLLM patch carries `lora_name` through, but Dynamo's hash function may need an audit before claiming correctness here. |
-| Multi-modal workloads (`extra_keys` field) | The vLLM patch explicitly falls back to placeholder behavior when `extra_keys` is non-empty. Out of scope; safe — no regression. |
-| Disk / NVMe tier (`StorageTier::Disk`) | Wired up but untested. The `--router-disk-cache-hit-weight=0.25` default is preserved unchanged. |
-
-### 7.3 Recommendations for upstream
-
-| Repo | Change | Rationale |
-|---|---|---|
-| vllm-project/vllm | Land `e074f0a` (PR #43468) | Without this, the entire downstream router stack is operating on placeholder events. Test coverage is in place. |
-| nvidia/dynamo | Land `6c2a73a` (medium alias) | One-line fix; defensive tests in place. |
-| nvidia/dynamo | Land `5b7725f` (lower-tier metric plumbing) | Required to make any of the above *observable*. |
-| nvidia/dynamo | Surface `--router-host-cache-hit-weight` / `--router-disk-cache-hit-weight` / `--router-prefill-load-scale` as CLI flags | Preserve existing defaults. Tunable image is already verified to byte-match hardcoded defaults. |
-| nvidia/dynamo | Change defaults: `host_cache_hit_weight: 0.75 → 1.0`, `prefill_load_scale: 1.0 → 10` | Modest, defensible changes. 95 % of the win. Conservative compared to `pl=100`. |
-
-### 7.4 Future work / next phase
-
-* **Group offload expansion (the next-phase work mentioned in §2.3).** This is the natural follow-up patch to commit 1. Expanding one chunk-level `BlockStored` into F GPU-block-level events with correct parent chain. Eviction path likewise.
-* **TTL-based pending-job leak prevention.** The connector-side side-table will leak entries if a store-job never completes (e.g., worker OOM during memcpy). Easy follow-up.
-* **End-to-end LoRA validation.** The vLLM patch carries `lora_name`; we have not actually run a multi-tenant LoRA workload through Dynamo to verify the hash agrees.
-* **`pl_scale` curve search.** Our heatmap had three points (1, 10, 100). The continuous curve probably has a knee somewhere between 5 and 30. Worth a finer-grained sweep to pin down a single recommended default.
-
----
-
-## 8. Summary
-
-* Three commits land the minimal payload that Dynamo's KV router needs to see the CPU offload tier of every worker. Without them, the lower-tier indexer is permanently empty and the router routes blind. **Necessary.**
-* Two cost-function constants (`host_cache_hit_weight`, `prefill_load_scale`) actively under-value cache affinity in the default config. Surfacing them as CLI flags and recommending new defaults (h=1.0, pl=10) unlocks the rest of the win. **Sufficient.**
-* At c=128 production saturation: +270 % throughput, −90 % TTFT, −66 pp wasted compute. The best image is within noise of the theoretical perfect router on our long-bench workload.
-* The improvement transfers cleanly to LMBench (LMCache team's standard bench), grows with prefix size, grows with concurrency, grows with request rate — i.e., the harder the workload, the more the patches earn.
-* Group / chunk offload (`block_size_factor > 1`) is the **next-phase** work, scoped and ready to start as a follow-up to commit 1.
-
----
-
-## Appendix A — Image stack
-
-| Tag | Base | host | disk | pl | host CLI | disk CLI | pl CLI | Purpose |
-|---|---|---|---|---|---|---|---|---|
-| `baseline-20260527` | — | 0.75 | 0.25 | 1.0 | ❌ | ❌ | ✅ | Upstream-main reference (A/B control) |
-| `demo-20260527` | — | 0.75 | 0.25 | 1.0 | ❌ | ❌ | ✅ | Treatment with the 3 commits, default cost-fn |
-| `demo-20260529-w10` | `demo-20260527` | **1.0** | 0.25 | 1.0 | ❌ | ❌ | ✅ | h=1.0 hardcoded (validation: +4 pp) |
-| `demo-20260529-w10-pl100` | `demo-20260529-w10` | 1.0 | 0.25 | **100** | ❌ | ❌ | ✅ | h=1.0 + pl=100 hardcoded (validation: best result) |
-| `demo-20260530-tunable` | `demo-20260527` | 0.75 | 0.25 | 1.0 | **✅** | **✅** | ✅ | Production sweep image; defaults match `demo-20260527` |
-
-The byte-equality check: `demo-20260530-tunable` with `--router-host-cache-hit-weight=1.0 --router-prefill-load-scale=100` produces results within 0.5 pp on every column compared to `demo-20260529-w10-pl100` running with no flags. CLI path is a pure refactor.
-
-## Appendix B — Reproducing the sweep
-
-```
-results/sweep-master-20260530T182821Z/
-├── _summary.csv               # one row per cycle, all metrics
-├── _master.log                # orchestrator log
-├── _retry.log                 # retry-pass orchestrator log
-├── plots/                     # all figures from this doc
-├── t1-01-baseline-default/    # per-cycle artifacts
-│   ├── bench.log              # raw bench output
-│   ├── stats.json             # bench statistics
-│   ├── metrics_frontend.txt   # Dynamo frontend Prometheus dump
-│   └── metrics_worker_*.txt   # per-worker vLLM Prometheus dumps (×8)
-└── ... (38 more cycles)
-```
-
-The sweep orchestrator (`orchestrator/run-sweep.sh` + `04-retry-pod.yaml`) drives the whole sequence end-to-end inside a single Kubernetes pod with its own ServiceAccount — no developer machine in the loop, no Teleport token to expire. To re-run, apply the SA/PVC/ConfigMap/Pod manifests in `orchestrator/`.
-
-## Appendix C — Code links
-
-* vLLM PR (commit 1): <https://github.com/vllm-project/vllm/pull/43468>
-* Dynamo branch (commits 2 & 3): `Change72/dynamo` @ `feat/kv-router-cpu-medium-alias`
-* Tunable image build context: thin overlay on `demo-20260527`, adding CLI flags in `components/src/dynamo/common/configuration/groups/kv_router_args.py`

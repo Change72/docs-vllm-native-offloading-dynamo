@@ -335,8 +335,6 @@ This sounds extreme but in practice **load balancing in a cache-rich workload is
 | **Default workload** | "long-bench" (`workloads/generate_multi_turn_longbench.json`): **128 conversations**, **`conv_prefix = 15 K` constant per-conversation** (no common prefix shared across conversations — each conversation gets its own 15 K excerpt from `pg1184.txt`/`pg2600.txt`/`pg10.txt`), **`num_turns ∈ uniform[30, 50]`** (~40 mean), per-turn input ∈ `uniform[60, 80]` tokens, per-turn output ∈ `uniform[40, 60]` tokens (**OSL ≈ 50**). **Effective ISL grows over turns** as chat history accumulates: **turn 1 ≈ 15.1 K, turn 40 ≈ 19.8 K, turn 50 ≈ 21 K**. `request_rate = 0.5 req/s/client`. Cache reuse comes purely from re-sticking each conversation's later turns to the worker that prefilled its earlier turns — *not* from any shared system prompt. |
 | **Orchestration** | dedicated `sweep-orchestrator` Pod with SA-mounted `kubectl`, runs an offline sequencing script that cold-restarts the DGD for each cycle, drives the bench, dumps Prometheus metrics for all 8 workers and the frontend, and writes a single `_summary.csv` row per cycle |
 
-A total of **41 benchmark cycles** ran end-to-end across six dimensions (Ablation, Concurrency, h × pl heatmap, Workload size, LMBench cross-validation, Request rate). All raw artifacts (`bench.log`, per-worker metrics, frontend metrics) are checked in under `results/sweep-master-20260530T182821Z/`.
-
 ### 6.2 Headline: ablation matrix  *(long-bench, c=64, rr=0.5)*
 
 ![T1 compute ablation](images/t1_compute_ablation.png)

@@ -60,7 +60,7 @@ Disk-tier weight is also exposed (`--router-disk-cache-hit-weight`) but is only 
 
 ## Pictures + full doc
 
-* Full writeup: `nscale-offload-demo/PRESENTATION.md` — diagnosis (§2), commits diff vs llm-d (§3), benchmark methodology (§6.1), 6 sweep tiers (§6.2–§6.9), upstream PR proposal (§7)
+* Full writeup: `nscale-offload-demo/PRESENTATION.md` — diagnosis (§2), commits diff vs llm-d (§3), cost-function deep-dive (§5), benchmark methodology (§6.1), full sweep + ablations (§6.2–§6.9), theoretical floor derivation (§6.10)
 * Plots: `nscale-offload-demo/images/{t2_concurrency, t4_prefix, t6_rr, lmbench_qps, c128_errorbars, tail_latency_c128, prewarm_ablation, ceiling_sweep, headline_progression, pl_curve, t3_heatmap}.png`
 * Raw data: `nscale-offload-demo/data/_summary.csv` (1 row per benchmark cycle, 110+ cycles)
 * Reproduction: `nscale-offload-demo/orchestrator/` — in-cluster Job runs the full sweep cold-restarting between cycles

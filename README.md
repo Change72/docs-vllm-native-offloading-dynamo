@@ -60,8 +60,9 @@ Full write-up in [`PRESENTATION.md`](PRESENTATION.md); Slack-friendly TL;DR in
 * **Dynamo `6c2a73a`** — accept `"CPU"` as an alias for the `HostPinned` tier so vLLM events match the indexer's medium-name expectations
 * **Dynamo `5b7725f`** — surface `kv_cache_events_applied` counters on Prometheus so the new CPU-tier traffic is observable end-to-end
 
-See `PRESENTATION.md` §2 for the diagnosis, §3 for the diff against `llm-d`, §4 for the
-commit details, §6 for the benchmarks, §7 for the upstream-PR proposal.
+See `PRESENTATION.md` §2 for the diagnosis, §3 for the diff against `llm-d` and commit
+details, §5 for the cost-function deep-dive, §6 for the benchmarks (incl. §6.4 for the
+upstream-default recommendation and §6.10 for the theoretical-floor derivation).
 
 ## Reproducing the sweep (high level)
 
@@ -99,7 +100,7 @@ kubectl apply -f deploy/best.yaml
 # … repeat the bench …
 ```
 
-## Anti-FAQ (saved for §7 of `PRESENTATION.md`, expanded here)
+## FAQ
 
 **"Are these numbers reproducible?"** Yes. §6.3.2 reports 3 cold-restart repeats at c=128
 across all 4 cohorts; all std-devs are < 1.5 pp on compute % and < 0.5 rps on throughput.

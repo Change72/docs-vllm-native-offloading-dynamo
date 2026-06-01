@@ -1,0 +1,57 @@
+# Per-cycle benchmark artifacts — keep summaries only
+results/
+results-phase4/
+results-phase5/
+*_stats.json
+*_metrics_worker_*.txt
+*_bench.log
+
+# Raw sweep logs (kept on PVC, not in git)
+_master.log
+_phase*.log
+_retry.log
+_rrextra.log
+
+# Render artifacts
+*.html
+__pycache__/
+*.pyc
+.DS_Store
+
+# Personal notes / scratch
+notes.md
+TODO.md
+.vscode/
+.idea/
+
+# Old / superseded scripts (kept locally for reference, but not part of the canonical deliverable)
+plot_sweep.py
+plot_sweep_v2.py
+analyze_sweep.py
+run_ab.sh
+run_gmax*.sh
+run_rerun_*.sh
+run_smoke_*.sh
+run_sweep*.sh
+
+# Intermediate / experimental deploy yamls (canonical set lives in deploy/)
+deploy-qwen3-32b-baseline-cpu150.yaml
+deploy-qwen3-32b-baseline-router.yaml
+deploy-qwen3-32b-baseline-saturate-4w.yaml
+deploy-qwen3-32b-baseline-saturate.yaml
+deploy-qwen3-32b-offload-router.yaml
+deploy-qwen3-32b-treatment-cpu150*.yaml
+deploy-qwen3-32b-treatment-router.yaml
+deploy-qwen3-32b-treatment-saturate*.yaml
+deploy-qwen3-32b-tunable-default.yaml
+bench-client-pod.yaml
+probe-image.yaml
+probe-newimage-b200.yaml
+
+# Root-level copies of files now living in subdirs
+generate_multi_turn_*.json
+cfg_prefix_*.json
+make_presentation_plots.py
+analyze_phase5.py
+analyze_tail_latency.py
+reparse_ph3_lmbench.py

@@ -1,0 +1,13 @@
+cycle_id,rps,elapsed_s,n_requests
+ph3-c-baseline-qps16,5.3692,65,349
+ph3-c-baseline-qps1,3.6250,40,145
+ph3-c-baseline-qps32,5.2462,65,341
+ph3-c-baseline-qps4,3.4262,61,209
+ph3-c-baseline-qps64,5.3231,65,346
+ph3-c-baseline-qps8,4.4462,65,289
+ph3-c-best-qps16,7.5238,63,474
+ph3-c-best-qps1,3.6500,40,146
+ph3-c-best-qps32,8.1719,64,523
+ph3-c-best-qps4,3.5574,61,217
+ph3-c-best-qps64,7.6250,64,488
+ph3-c-best-qps8,5.0159,63,316

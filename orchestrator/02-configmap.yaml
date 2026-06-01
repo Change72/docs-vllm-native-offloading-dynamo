@@ -1,0 +1,232 @@
+apiVersion: v1
+data:
+  longbench-template.json: |
+    {
+      "filetype": "generate_conversations",
+      "num_conversations": 128,
+      "text_files": ["pg1184.txt", "pg2600.txt", "pg10.txt"],
+      "print_stats": false,
+      "prompt_input": {
+        "num_turns": {
+          "distribution": "uniform",
+          "min": 30,
+          "max": 50
+        },
+        "common_prefix_num_tokens": {
+          "distribution": "constant",
+          "value": 0
+        },
+        "prefix_num_tokens": {
+          "distribution": "constant",
+          "value": 15000
+        },
+        "num_tokens": {
+          "distribution": "uniform",
+          "min": 60,
+          "max": 80
+        }
+      },
+      "prompt_output": {
+        "num_tokens": {
+          "distribution": "uniform",
+          "min": 40,
+          "max": 60
+        }
+      }
+    }
+  run-sweep.sh: "#!/usr/bin/env bash\n# Master sweep orchestrator (runs INSIDE orchestrator
+    pod).\n# Sequentially: cold-restart DGD → wait ready → run bench → dump artifacts.\n#
+    Failures don't abort — script marks cycle FAIL and continues.\nset +e; set +u\n\nNS=changg-dynamo\nDGD=qwen3-32b-offload-router\nCLIENT=bench-multi-turn\nRESULTS=/results\nmkdir
+    -p $RESULTS\nSUMMARY=$RESULTS/_summary.csv\n[ -f $SUMMARY ] || echo \"cycle_id,label,image,h,disk,pl,workload,c,rr,runtime_s,rps,ttft_mean,tpot_mean,latency_mean,gpu_block,ext_block,gpu_tok,ext_tok,compute_tok,overall_tok,g2c_GB,c2g_GB,bench_log_path,status\"
+    > $SUMMARY\n\nBASELINE_IMG=\"docker.io/change1472/dynamo-vllm-cpu-offload@sha256:0ca50b96c070e728fbe806aa222f5e1ee5357aade03e31b8ef0facc47dd9ee34\"\nTUNABLE_IMG=\"docker.io/change1472/dynamo-vllm-cpu-offload@sha256:0340789292b9a70a218c3d5ef5cd3674e585a400a644812b20c58d2360fb4879\"\n\nlog()
+    { echo \"[$(date '+%H:%M:%S')] $*\" | tee -a $RESULTS/_master.log; }\n\n# ---
+    generate DGD yaml on-the-fly ---\ngen_dgd_yaml() {\n  local image=$1; local h=$2;
+    local disk=$3; local pl=$4; local cpu_bytes=$5\n  cat <<EOF\napiVersion: nvidia.com/v1beta1\nkind:
+    DynamoGraphDeployment\nmetadata:\n  name: $DGD\n  namespace: $NS\nspec:\n  components:\n
+    \ - name: Frontend\n    type: frontend\n    replicas: 1\n    podTemplate:\n      spec:\n
+    \       containers:\n        - name: main\n          image: $image\n          imagePullPolicy:
+    IfNotPresent\n          command: [\"python3\"]\n          args:\n          - -m\n
+    \         - dynamo.frontend\n          - --http-port\n          - \"8000\"\n          -
+    --router-mode\n          - kv\n          - --router-reset-states\n$( [ -n \"$h\"
+    ] && printf '          - --router-host-cache-hit-weight\\n          - \"%s\"\\n'
+    \"$h\" )\n$( [ -n \"$disk\" ] && printf '          - --router-disk-cache-hit-weight\\n
+    \         - \"%s\"\\n' \"$disk\" )\n$( [ -n \"$pl\" ] && printf '          - --router-prefill-load-scale\\n
+    \         - \"%s\"\\n' \"$pl\" )\n          env:\n          - name: DYN_ROUTER_MODE\n
+    \           value: kv\n          - name: NATS_SERVER\n            value: nats://dynamo-platform-nats.dynamo-system.svc.cluster.local:4222\n
+    \         - name: DYN_DISCOVERY_BACKEND\n            value: kubernetes\n  - name:
+    VllmDecodeWorker\n    type: worker\n    replicas: 8\n    extraPodSpec:\n      tolerations:\n
+    \     - key: nvidia.com/gpu\n        operator: Equal\n        value: \"true\"\n
+    \       effect: NoSchedule\n      mainContainer:\n        image: $image\n        imagePullPolicy:
+    IfNotPresent\n        command: [\"python3\"]\n        args:\n        - -m\n        -
+    dynamo.vllm\n        - --model\n        - Qwen/Qwen3-32B\n        - --enforce-eager\n
+    \       - --gpu-memory-utilization\n        - \"0.50\"\n        - --kv-transfer-config\n
+    \       - '{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":$cpu_bytes}}'\n
+    \       - --kv-events-config\n        - '{\"publisher\":\"zmq\",\"topic\":\"kv-events\",\"endpoint\":\"tcp://*:20080\",\"enable_kv_cache_events\":true}'\n
+    \       envFrom:\n        - secretRef:\n            name: hf-token-secret\n        env:\n
+    \       - name: HF_HOME\n          value: /home/dynamo/.cache/huggingface\n        -
+    name: DYN_HEALTH_CHECK_ENABLED\n          value: \"false\"\n        - name: NATS_SERVER\n
+    \         value: nats://dynamo-platform-nats.dynamo-system.svc.cluster.local:4222\n
+    \       - name: DYN_DISCOVERY_BACKEND\n          value: kubernetes\n        resources:\n
+    \         limits:\n            cpu: \"16\"\n            memory: \"300Gi\"\n            nvidia.com/gpu:
+    \"1\"\n          requests:\n            cpu: \"8\"\n            memory: \"220Gi\"\n
+    \           nvidia.com/gpu: \"1\"\n        volumeMounts:\n        - mountPath:
+    /home/dynamo/.cache/huggingface\n          name: model-cache\nEOF\n}\n\nwait_ready()
+    {\n  for i in $(seq 1 180); do\n    sleep 10\n    local r=$(kubectl get pod -n
+    $NS -l grove.io/podclique=$DGD-0-vllmdecodeworker --no-headers 2>/dev/null | grep
+    \"1/1\" | wc -l | tr -d ' ')\n    local f=$(kubectl get pod -n $NS -l grove.io/podclique=$DGD-0-frontend
+    --no-headers 2>/dev/null | grep \"1/1\" | wc -l | tr -d ' ')\n    if [ $((i %
+    6)) = 0 ]; then log \"  wait $((i*10))s: workers=$r/8 frontend=$f/1\"; fi\n    [
+    \"$r\" = \"8\" ] && [ \"$f\" = \"1\" ] && return 0\n  done\n  return 1\n}\n\ncold_restart()
+    {\n  local image=$1; local h=$2; local disk=$3; local pl=$4\n  # all our images
+    use 150 GB CPU offload (matches all previous experiments)\n  local cpu_bytes=161061273600\n
+    \ log \"cold restart: image=...${image: -12}  h=$h disk=$disk pl=$pl\"\n  kubectl
+    delete dgd $DGD -n $NS --ignore-not-found 2>&1 | head -1 >> $RESULTS/_master.log\n
+    \ sleep 15\n  gen_dgd_yaml \"$image\" \"$h\" \"$disk\" \"$pl\" \"$cpu_bytes\"
+    | kubectl apply -f - 2>&1 | head -1 >> $RESULTS/_master.log\n  wait_ready\n}\n\ndump_artifacts()
+    {\n  local cycle_id=$1; local dir=$RESULTS/$cycle_id; mkdir -p $dir\n  kubectl
+    cp \"$NS/$CLIENT:/work/_bench.log\" \"$dir/bench.log\" 2>/dev/null\n  kubectl
+    cp \"$NS/$CLIENT:/work/_stats.json\" \"$dir/stats.json\" 2>/dev/null\n  local
+    fpod=$(kubectl get pod -n $NS -o name 2>/dev/null | grep frontend | head -1 |
+    cut -d/ -f2)\n  [ -n \"$fpod\" ] && kubectl exec \"$fpod\" -n $NS -- curl -sf
+    http://localhost:8000/metrics > \"$dir/metrics_frontend.txt\" 2>/dev/null\n  for
+    w in $(kubectl get pod -n $NS -o name 2>/dev/null | grep vllmdecodeworker | cut
+    -d/ -f2); do\n    local short=$(echo $w | rev | cut -d- -f1 | rev)\n    kubectl
+    exec \"$w\" -n $NS -- curl -sf http://localhost:9090/metrics > \"$dir/metrics_worker_${short}.txt\"
+    2>/dev/null &\n  done\n  wait\n}\n\n# parse metrics + bench log → append summary
+    CSV row\ncollect_metrics() {\n  local cycle_id=$1; local label=$2; local image=$3;
+    local h=$4; local disk=$5; local pl=$6\n  local workload=$7; local c=$8; local
+    rr=$9; local status=\"${10}\"\n  local dir=$RESULTS/$cycle_id\n  python3 - \"$dir\"
+    \"$cycle_id\" \"$label\" \"$image\" \"$h\" \"$disk\" \"$pl\" \"$workload\" \"$c\"
+    \"$rr\" \"$status\" \"$SUMMARY\" <<'PY'\nimport sys, re, os, csv\nfrom pathlib
+    import Path\ndir_, cycle_id, label, image, h, disk, pl, workload, c, rr, status,
+    summary = sys.argv[1:13]\ndir_p = Path(dir_)\ndef parse_bench():\n    bl = (dir_p/'bench.log')\n
+    \   if not bl.exists(): return {}\n    t = bl.read_text()\n    m = {}\n    for
+    k, p in [('runtime', r'runtime_sec\\s*=\\s*([\\d.]+)'), ('rps', r'requests_per_sec\\s*=\\s*([\\d.]+)')]:\n
+    \       x = re.search(p, t)\n        if x: m[k] = float(x.group(1))\n    for col,
+    regex in [('ttft_mean', r'^ttft_ms\\s+[\\d.]+\\s+([\\d.]+)'), \n                        ('tpot_mean',
+    r'^tpot_ms\\s+[\\d.]+\\s+([\\d.]+)'),\n                        ('latency_mean',
+    r'^latency_ms\\s+[\\d.]+\\s+([\\d.]+)')]:\n        x = re.search(regex, t, re.M)\n
+    \       if x: m[col] = float(x.group(1))\n    return m\ndef parse_metrics():\n
+    \   g_h=g_q=e_h=e_q=g2c=c2g=tl=te=tc=0\n    for wf in dir_p.glob('metrics_worker_*.txt'):\n
+    \       txt = wf.read_text()\n        def grab(pat, t=txt):\n            return
+    sum(float(m.group(1)) for m in re.finditer(pat, t, re.M))\n        g_h += grab(r'^vllm:prefix_cache_hits_total\\{[^}]*\\}\\s+([\\d.eE+-]+)')\n
+    \       g_q += grab(r'^vllm:prefix_cache_queries_total\\{[^}]*\\}\\s+([\\d.eE+-]+)')\n
+    \       e_h += grab(r'^vllm:external_prefix_cache_hits_total\\{[^}]*\\}\\s+([\\d.eE+-]+)')\n
+    \       e_q += grab(r'^vllm:external_prefix_cache_queries_total\\{[^}]*\\}\\s+([\\d.eE+-]+)')\n
+    \       g2c += grab(r'^vllm:kv_offload_total_bytes_total\\{[^}]*GPU_to_CPU[^}]*\\}\\s+([\\d.eE+-]+)')\n
+    \       c2g += grab(r'^vllm:kv_offload_total_bytes_total\\{[^}]*CPU_to_GPU[^}]*\\}\\s+([\\d.eE+-]+)')\n
+    \       tl += grab(r'^vllm:prompt_tokens_by_source_total\\{[^}]*source=\"local_cache_hit\"[^}]*\\}\\s+([\\d.eE+-]+)')\n
+    \       te += grab(r'^vllm:prompt_tokens_by_source_total\\{[^}]*source=\"external_kv_transfer\"[^}]*\\}\\s+([\\d.eE+-]+)')\n
+    \       tc += grab(r'^vllm:prompt_tokens_by_source_total\\{[^}]*source=\"local_compute\"[^}]*\\}\\s+([\\d.eE+-]+)')\n
+    \   tot = tl + te + tc\n    return dict(gpu_block=g_h/g_q*100 if g_q else 0, ext_block=e_h/e_q*100
+    if e_q else 0,\n                gpu_tok=tl/tot*100 if tot else 0, ext_tok=te/tot*100
+    if tot else 0,\n                compute_tok=tc/tot*100 if tot else 0, overall_tok=(tl+te)/tot*100
+    if tot else 0,\n                g2c_GB=g2c/1e9, c2g_GB=c2g/1e9)\nb = parse_bench();
+    m = parse_metrics()\nimg_short = image.split('@')[-1][-12:] if '@' in image else
+    image[-12:]\nrow = [cycle_id, label, img_short, h, disk, pl, workload, c, rr,\n
+    \      f\"{b.get('runtime', 0):.0f}\", f\"{b.get('rps', 0):.2f}\",\n       f\"{b.get('ttft_mean',
+    0):.0f}\", f\"{b.get('tpot_mean', 0):.1f}\", f\"{b.get('latency_mean', 0):.0f}\",\n
+    \      f\"{m['gpu_block']:.2f}\", f\"{m['ext_block']:.2f}\",\n       f\"{m['gpu_tok']:.1f}\",
+    f\"{m['ext_tok']:.1f}\", f\"{m['compute_tok']:.1f}\", f\"{m['overall_tok']:.1f}\",\n
+    \      f\"{m['g2c_GB']:.0f}\", f\"{m['c2g_GB']:.0f}\", str(dir_p/'bench.log'),
+    status]\nwith open(summary, 'a') as f:\n    csv.writer(f).writerow(row)\nprint(f\"
+    \ summary: compute={m['compute_tok']:.1f}% overall={m['overall_tok']:.1f}% rps={b.get('rps',
+    0):.2f}\")\nPY\n}\n\nrun_cycle() {\n  local cycle_id=$1; local label=$2; local
+    image=$3\n  local h=$4; local disk=$5; local pl=$6\n  local workload_json=$7;
+    local c=$8; local rr=$9\n  \n  log \"\"\n  log \"============================================================\"\n
+    \ log \"CYCLE $cycle_id  | $label | h=$h disk=$disk pl=$pl | $workload_json c=$c
+    rr=$rr\"\n  log \"============================================================\"\n\n
+    \ cold_restart \"$image\" \"$h\" \"$disk\" \"$pl\"\n  if [ $? -ne 0 ]; then log
+    \"[FAIL] DGD not ready\"; collect_metrics \"$cycle_id\" \"$label\" \"$image\"
+    \"$h\" \"$disk\" \"$pl\" \"$workload_json\" \"$c\" \"$rr\" \"FAIL_NOREADY\"; return;
+    fi\n\n  log \"  launching bench...\"\n  kubectl exec $CLIENT -n $NS -- bash -c
+    \"\n    cd /work/multi_turn\n    rm -f /work/_bench.log /work/_stats.json\n    nohup
+    python3 benchmark_serving_multi_turn.py \\\\\n      --model Qwen/Qwen3-32B --served-model-name
+    Qwen/Qwen3-32B \\\\\n      --url http://qwen3-32b-offload-router-frontend.changg-dynamo.svc.cluster.local:8000
+    \\\\\n      --input-file $workload_json \\\\\n      --num-clients $c --max-active-conversations
+    $c \\\\\n      --request-rate $rr --warmup-step \\\\\n      --stats-json-output
+    /work/_stats.json > /work/_bench.log 2>&1 &\n  \" >> $RESULTS/_master.log\n\n
+    \ # poll up to 60 min\n  for i in $(seq 1 120); do\n    sleep 30\n    local done=$(kubectl
+    exec $CLIENT -n $NS -- bash -c \"grep -c 'Statistics summary' /work/_bench.log
+    2>/dev/null\" 2>/dev/null | tr -d '\\n' || echo 0)\n    [ \"$done\" = \"1\" ]
+    && { log \"  [done at $((i/2))min]\"; sleep 5; break; }\n    local crash=$(kubectl
+    exec $CLIENT -n $NS -- bash -c \"grep -c 'AssertionError\\|RuntimeError\\|Traceback'
+    /work/_bench.log 2>/dev/null\" 2>/dev/null | tr -d '\\n' || echo 0)\n    [ \"$crash\"
+    != \"0\" ] && [ \"$crash\" != \"\" ] && { log \"  [CRASH at $((i/2))min]\"; break;
+    }\n    [ $((i % 4)) = 0 ] && log \"  poll $((i/2))min\"\n  done\n\n  dump_artifacts
+    \"$cycle_id\"\n  collect_metrics \"$cycle_id\" \"$label\" \"$image\" \"$h\" \"$disk\"
+    \"$pl\" \"$workload_json\" \"$c\" \"$rr\" \"OK\"\n}\n\n# ============================================================\n#
+    SWEEP PLAN\n# ============================================================\nT0=$(date
+    +%s)\nlog \"==========================\"\nlog \"MASTER SWEEP START $(date)\"\nlog
+    \"results dir: $RESULTS\"\nlog \"==========================\"\n\n# ----------
+    TIER 1: Ablation matrix (long-bench, c=64) ----------\nLONG=generate_multi_turn_longbench.json\nlog
+    \"\"\nlog \"##### TIER 1: ABLATION MATRIX (long-bench, c=64, rr=0.5) #####\"\nrun_cycle
+    t1-01-baseline-default       \"baseline+default\" $BASELINE_IMG \"\" \"\" \"\"
+    \   $LONG 64 0.5\nrun_cycle t1-02-baseline-pl100         \"baseline+pl100\"   $BASELINE_IMG
+    \"\" \"\" \"100\" $LONG 64 0.5\nrun_cycle t1-03-tunable-h075-pl1       \"tunable
+    h=0.75 pl=1\"   $TUNABLE_IMG \"0.75\" \"0.25\" \"1\"   $LONG 64 0.5\nrun_cycle
+    t1-04-tunable-h075-pl100     \"tunable h=0.75 pl=100\" $TUNABLE_IMG \"0.75\" \"0.25\"
+    \"100\" $LONG 64 0.5\nrun_cycle t1-05-tunable-h1-pl1         \"tunable h=1.0 pl=1\"
+    \   $TUNABLE_IMG \"1.0\"  \"0.25\" \"1\"   $LONG 64 0.5\nrun_cycle t1-06-tunable-h1-pl100
+    \      \"tunable h=1.0 pl=100\"  $TUNABLE_IMG \"1.0\"  \"0.25\" \"100\" $LONG
+    64 0.5\n\n# ---------- TIER 2: Concurrency sweep ----------\nlog \"\"\nlog \"#####
+    TIER 2: CONCURRENCY SWEEP (long-bench, rr=0.5) #####\"\nfor c in 8 16 32 64 96
+    128 192; do\n  run_cycle \"t2-baseline-c${c}\"  \"baseline c=$c\"  $BASELINE_IMG
+    \"\"    \"\"     \"\"    $LONG $c 0.5\n  run_cycle \"t2-best-c${c}\"      \"best
+    c=$c\"      $TUNABLE_IMG  \"1.0\" \"0.25\" \"100\" $LONG $c 0.5\ndone\n\n# ----------
+    TIER 3: (h, pl) heatmap @ c=64 ----------\nlog \"\"\nlog \"##### TIER 3: (h, pl)
+    HEATMAP (long-bench, c=64) #####\"\nfor h in 0.75 1.0 1.25; do\n  for pl in 1
+    10 100; do\n    # skip duplicates of T1\n    if [ \"$h\" = \"0.75\" ] && [ \"$pl\"
+    = \"1\" ]; then continue; fi\n    if [ \"$h\" = \"0.75\" ] && [ \"$pl\" = \"100\"
+    ]; then continue; fi\n    if [ \"$h\" = \"1.0\" ] && [ \"$pl\" = \"1\" ]; then
+    continue; fi\n    if [ \"$h\" = \"1.0\" ] && [ \"$pl\" = \"100\" ]; then continue;
+    fi\n    run_cycle \"t3-h${h}-pl${pl}\" \"tunable h=$h pl=$pl\" $TUNABLE_IMG \"$h\"
+    \"0.25\" \"$pl\" $LONG 64 0.5\n  done\ndone\n\n# ---------- TIER 4: conv_prefix
+    workload sweep ----------\n# generate configs on-the-fly\nlog \"\"\nlog \"#####
+    TIER 4: conv_prefix SWEEP (c=64) #####\"\nfor prefix in 5000 25000; do\n  cfg=\"/tmp/cfg_prefix_${prefix}.json\"\n
+    \ python3 -c \"\nimport json\nc = json.load(open('/configs/longbench-template.json'))\nc['prompt_input']['prefix_num_tokens']['value']
+    = $prefix\nc['num_conversations'] = max(64, min(2400000 // $prefix, 200))\njson.dump(c,
+    open('$cfg', 'w'))\n\"\n  kubectl cp $cfg $NS/$CLIENT:/work/multi_turn/cfg_prefix_${prefix}.json\n
+    \ for variant in baseline best; do\n    if [ \"$variant\" = \"baseline\" ]; then
+    img=$BASELINE_IMG; h=\"\"; pl=\"\";\n    else img=$TUNABLE_IMG; h=\"1.0\"; pl=\"100\";
+    fi\n    run_cycle \"t4-${variant}-prefix${prefix}\" \"${variant} prefix=${prefix}\"
+    $img \"$h\" \"0.25\" \"$pl\" \"cfg_prefix_${prefix}.json\" 64 0.5\n  done\ndone\n\n#
+    ---------- TIER 5: LMBench scaled ----------\nlog \"\"\nlog \"##### TIER 5: LMBench
+    scaled (NUM_USERS=64, QPS=32) #####\"\nrun_lmbench() {\n  local cycle_id=$1; local
+    label=$2; local image=$3; local h=$4; local pl=$5\n  log \"\"\n  log \"============================================================\"\n
+    \ log \"CYCLE $cycle_id  | $label (LMBench)\"\n  log \"============================================================\"\n
+    \ cold_restart \"$image\" \"$h\" \"0.25\" \"$pl\"\n  [ $? -ne 0 ] && { log \"[FAIL]\";
+    return; }\n  log \"  launching LMBench...\"\n  kubectl exec $CLIENT -n $NS --
+    bash -c \"\n    cd /work/lmbench\n    rm -f /work/_lmbench.log /work/_lmbench_output_32.csv\n
+    \   export NUM_USERS_WARMUP=64 NUM_USERS=64 NUM_ROUNDS=40\n    export SYSTEM_PROMPT=0
+    CHAT_HISTORY=15000 ANSWER_LEN=100 INIT_USER_ID=1 TEST_DURATION=200\n    nohup
+    ./long_input_short_output_run.sh 'Qwen/Qwen3-32B' \\\\\n      'http://qwen3-32b-offload-router-frontend.changg-dynamo.svc.cluster.local:8000'
+    \\\\\n      '/work/_lmbench' 32 > /work/_lmbench.log 2>&1 &\n  \" >> $RESULTS/_master.log\n
+    \ for i in $(seq 1 60); do\n    sleep 30\n    local done=$(kubectl exec $CLIENT
+    -n $NS -- bash -c \"grep -c 'Performance summary' /work/_lmbench.log 2>/dev/null\"
+    2>/dev/null | tr -d '\\n' || echo 0)\n    [ \"$done\" -ge 2 ] && { log \"  [done
+    at $((i/2))min]\"; sleep 5; break; }\n    [ $((i % 4)) = 0 ] && log \"  poll $((i/2))min\"\n
+    \ done\n  # dump\n  local dir=$RESULTS/$cycle_id; mkdir -p $dir\n  kubectl cp
+    \"$NS/$CLIENT:/work/_lmbench.log\" \"$dir/bench.log\" 2>/dev/null\n  kubectl cp
+    \"$NS/$CLIENT:/work/_lmbench_output_32.csv\" \"$dir/lmbench.csv\" 2>/dev/null\n
+    \ for w in $(kubectl get pod -n $NS -o name 2>/dev/null | grep vllmdecodeworker
+    | cut -d/ -f2); do\n    short=$(echo $w | rev | cut -d- -f1 | rev)\n    kubectl
+    exec \"$w\" -n $NS -- curl -sf http://localhost:9090/metrics > \"$dir/metrics_worker_${short}.txt\"
+    2>/dev/null &\n  done\n  wait\n  collect_metrics \"$cycle_id\" \"$label\" \"$image\"
+    \"$h\" \"0.25\" \"$pl\" \"lmbench\" \"64\" \"0.5\" \"OK\"\n}\nrun_lmbench t5-01-baseline
+    \     \"lmbench baseline\"   $BASELINE_IMG \"\"    \"\"\nrun_lmbench t5-02-tunable-h075-pl1
+    \  \"lmbench h=0.75 pl=1\"   $TUNABLE_IMG \"0.75\" \"1\"\nrun_lmbench t5-03-tunable-h1-pl1
+    \    \"lmbench h=1.0 pl=1\"    $TUNABLE_IMG \"1.0\"  \"1\"\nrun_lmbench t5-04-tunable-h1-pl100
+    \  \"lmbench h=1.0 pl=100\"  $TUNABLE_IMG \"1.0\"  \"100\"\n\n# ---------- TIER
+    6: rr sweep @ c=64 ----------\nlog \"\"\nlog \"##### TIER 6: rr SWEEP (long-bench,
+    c=64) #####\"\nfor rr in 0.1 1.0; do\n  # 0.5 already in T1\n  run_cycle \"t6-baseline-rr${rr}\"
+    \"baseline rr=$rr\" $BASELINE_IMG \"\"    \"\"     \"\"    $LONG 64 $rr\n  run_cycle
+    \"t6-best-rr${rr}\"     \"best rr=$rr\"    $TUNABLE_IMG  \"1.0\" \"0.25\" \"100\"
+    $LONG 64 $rr\ndone\n\nT1=$(date +%s)\nlog \"\"\nlog \"==========================\"\nlog
+    \"SWEEP COMPLETE at $(date), elapsed $(( (T1-T0) / 60 )) min\"\nlog \"summary
+    CSV: $SUMMARY\"\nlog \"==========================\"\nsleep infinity   # keep pod
+    alive for kubectl cp\n"
+kind: ConfigMap
+metadata:
+  name: sweep-orchestrator-config
+  namespace: changg-dynamo

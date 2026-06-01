@@ -1,0 +1,50 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sweep-phase4
+  namespace: changg-dynamo
+  labels:
+    app: sweep-phase4
+spec:
+  serviceAccountName: sweep-orchestrator-sa
+  restartPolicy: Never
+  containers:
+  - name: orchestrator
+    image: python:3.11-slim
+    imagePullPolicy: IfNotPresent
+    securityContext:
+      runAsUser: 0
+    command: ["bash", "-c"]
+    args:
+    - |
+      set -e
+      echo "[phase4] installing kubectl..."
+      apt-get update -qq && apt-get install -y -qq curl ca-certificates > /dev/null 2>&1
+      curl -sLo /usr/local/bin/kubectl https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl
+      chmod +x /usr/local/bin/kubectl
+      kubectl version --client=true 2>&1 | head -1
+      mkdir -p /results
+      cp /configmap/run-phase4.sh /tmp/run-phase4.sh
+      chmod +x /tmp/run-phase4.sh
+      echo "[phase4] starting at $(date)"
+      bash /tmp/run-phase4.sh
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "1Gi"
+      limits:
+        cpu: "2"
+        memory: "4Gi"
+    volumeMounts:
+    - name: configmap-volume
+      mountPath: /configmap
+    - name: results
+      mountPath: /results
+  volumes:
+  - name: configmap-volume
+    configMap:
+      name: sweep-phase4-config
+      defaultMode: 0755
+  - name: results
+    persistentVolumeClaim:
+      claimName: sweep-results

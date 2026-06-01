@@ -1,0 +1,112 @@
+# nscale B200 - vLLM CPU offload (OffloadingConnector) + Dynamo KV router
+# ===== BASELINE image (no user patches) =====
+#
+# Image:   docker.io/change1472/dynamo-vllm-cpu-offload:baseline-20260527
+# Digest:  sha256:0ca50b96c070e728fbe806aa222f5e1ee5357aade03e31b8ef0facc47dd9ee34
+# Pinned by digest (not tag) to avoid kubelet IfNotPresent hitting old sm_89-only
+# image cached at same :baseline-20260527 tag.
+#
+# Verified on B200 (probe-newimage-b200): _C.so cubin contains sm_100+sm_120,
+# Qwen3-32B-size matmul + vllm rms_norm all pass.
+#
+# Deployment shape: Kris's agg_kvbm_router.sh-equivalent for OffloadingConnector path.
+# 8 worker tp1, --enforce-eager, --gpu-memory-utilization 0.95 (B200 has 192GB but we
+# keep H100-style headroom math; can revisit), default max_model_len, kv-events ZMQ.
+#
+# Treatment image swap: only change the two `image:` digest references.
+
+apiVersion: nvidia.com/v1beta1
+kind: DynamoGraphDeployment
+metadata:
+  name: qwen3-32b-offload-router
+spec:
+  components:
+  - name: Frontend
+    type: frontend
+    replicas: 1
+    podTemplate:
+      spec:
+        containers:
+        - name: main
+          image: docker.io/change1472/dynamo-vllm-cpu-offload@sha256:0ca50b96c070e728fbe806aa222f5e1ee5357aade03e31b8ef0facc47dd9ee34
+          imagePullPolicy: IfNotPresent
+          command: ["python3"]
+          args:
+          - -m
+          - dynamo.frontend
+          - --http-port
+          - "8000"
+          - --router-mode
+          - kv
+          - --router-reset-states
+          env:
+          - name: DYN_ROUTER_MODE
+            value: kv
+          - name: NATS_SERVER
+            value: nats://dynamo-platform-nats.dynamo-system.svc.cluster.local:4222
+          - name: DYN_DISCOVERY_BACKEND
+            value: kubernetes
+
+  - name: VllmDecodeWorker
+    type: worker
+    replicas: 8
+    podTemplate:
+      spec:
+        tolerations:
+        # nscale GPU nodes all have nvidia.com/gpu=true:NoSchedule taint
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+        containers:
+        - name: main
+          image: docker.io/change1472/dynamo-vllm-cpu-offload@sha256:0ca50b96c070e728fbe806aa222f5e1ee5357aade03e31b8ef0facc47dd9ee34
+          imagePullPolicy: IfNotPresent
+          command: ["python3"]
+          args:
+          - -m
+          - dynamo.vllm
+          - --model
+          - Qwen/Qwen3-32B
+          - --enforce-eager
+          # B200 has 192 GB but Qwen3-32B BF16 weights ~64GB + activations.
+          # Default 0.9 left only 9.43 GiB for KV cache on H100; with 0.95 we got
+          # plenty of headroom. On B200 even default 0.9 should be ample (96GB+
+          # leftover), keep 0.95 for symmetry with aws-dev-02 run.
+          - --gpu-memory-utilization
+          - "0.50"
+          # ── OffloadingConnector (vLLM native CPU offload, user fork target) ──
+          # vllm 0.21.0 schema requires `cpu_bytes_to_use` (bytes), not num_cpu_blocks.
+          # See /usr/local/lib/python3.12/dist-packages/vllm/v1/kv_offload/cpu/spec.py
+          # cpu_bytes_to_use = 60 GiB = 60*1024^3 = 64424509440 bytes
+          # (matches Kris's DYN_KVBM_CPU_CACHE_GB=60 best-case).
+          - --kv-transfer-config
+          - '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":64424509440}}'
+          # ── KV events: vLLM → ZMQ → Dynamo router indexer ────────────────────
+          - --kv-events-config
+          - '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:20080","enable_kv_cache_events":true}'
+          envFrom:
+          - secretRef:
+              name: hf-token-secret
+          env:
+          - name: HF_HOME
+            value: /home/dynamo/.cache/huggingface
+          - name: DYN_HEALTH_CHECK_ENABLED
+            value: "false"
+          - name: NATS_SERVER
+            value: nats://dynamo-platform-nats.dynamo-system.svc.cluster.local:4222
+          - name: DYN_DISCOVERY_BACKEND
+            value: kubernetes
+          resources:
+            requests:
+              nvidia.com/gpu: "1"
+              memory: "150Gi"
+              cpu: "8"
+            limits:
+              nvidia.com/gpu: "1"
+              memory: "200Gi"
+              cpu: "16"
+          volumeMounts:
+          # operator auto-injects PVC volume for this name
+          - name: model-cache
+            mountPath: /home/dynamo/.cache/huggingface

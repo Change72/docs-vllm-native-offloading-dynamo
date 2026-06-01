@@ -1,0 +1,63 @@
+# Multi-turn benchmark client for nscale B200 DGD.
+# Uses user's treatment image (has python 3.12, transformers, vllm); no GPU needed.
+# Bootstrap clones user's vllm fork bench branch (conversation_id opt-in) + downloads
+# pg1184.txt + pip-installs missing deps (aiohttp, xlsxwriter, tqdm).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bench-multi-turn
+  namespace: changg-dynamo
+spec:
+  restartPolicy: Never
+  schedulerName: default-scheduler
+  containers:
+  - name: client
+    image: docker.io/change1472/dynamo-vllm-cpu-offload@sha256:11f2d56b24eeb45a96984562f8116cfc42e0d32d1a1a03455100e040ece83d0b
+    imagePullPolicy: IfNotPresent
+    command: ["bash", "-c"]
+    args:
+    - |
+      set -eux
+      mkdir -p /work/multi_turn
+      cd /work/multi_turn
+
+      # No git in user image; download bench files from user's fork via raw URL.
+      RAW=https://raw.githubusercontent.com/Change72/vllm/bench/multi_turn-conversation_id-opt-in/benchmarks/multi_turn
+      for f in benchmark_serving_multi_turn.py bench_dataset.py bench_utils.py generate_multi_turn.json requirements.txt; do
+        [ -f $f ] || wget -q $RAW/$f -O $f
+      done
+      ls -la
+
+      # pg1184.txt for synthetic conversation generation
+      if [ ! -f pg1184.txt ]; then
+        wget -q https://www.gutenberg.org/ebooks/1184.txt.utf-8 -O pg1184.txt
+      fi
+      ls -la pg1184.txt
+
+      # Install benchmark deps not already in image
+      pip install --no-cache-dir -r requirements.txt 2>&1 | tail -5
+
+      echo "bootstrap done at $(date -u +%FT%TZ)"
+
+      # Keep alive for manual exec (forever — kill pod manually when done)
+      sleep infinity
+    envFrom:
+    - secretRef:
+        name: hf-token-secret
+    env:
+    - name: HF_HOME
+      value: /home/dynamo/.cache/huggingface
+    resources:
+      requests:
+        cpu: "4"
+        memory: "8Gi"
+      limits:
+        cpu: "8"
+        memory: "16Gi"
+    volumeMounts:
+    - name: model-cache
+      mountPath: /home/dynamo/.cache/huggingface
+  volumes:
+  - name: model-cache
+    persistentVolumeClaim:
+      claimName: model-cache

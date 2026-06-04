@@ -1,5 +1,13 @@
 # vLLM × Dynamo CPU Tier Integration — Diagnosis, Fix, Benchmarks
 
+> ## ➡️ STAGE 3 (latest): chunk offloading is now router-matchable
+> Chunked CPU offload (`block_size_factor > 1`) used to be invisible to KV-cache-aware routers.
+> A **vLLM-side-only** fix (now on the existing PR, branch
+> `bugfix/offloading-connector-blockstored-payload` @ `54044fad4`) makes it **fully matchable on
+> llm-d — 94.3% coverage, 68/68 contiguous, store + remove**. Status, readiness matrix, and the
+> remaining plan (Dynamo 1:many, `extra_keys`, sliding-window/SSM) are the **plan of record**:
+> **→ [`STAGE3-CHUNK-OFFLOADING-PLAN.md`](STAGE3-CHUNK-OFFLOADING-PLAN.md)**
+
 This repo contains the writeup, plots, raw data, deployment artifacts, and orchestration
 scripts for the nscale B200 work on enabling vLLM's `OffloadingConnector` (CPU KV-cache
 tier) to be actually visible to Dynamo's KV-router, plus the cost-function tuning that

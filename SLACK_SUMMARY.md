@@ -47,6 +47,10 @@ Reading c=128 compute waste %:
 * **Pre-warm ablation** (5 min low-intensity warmup, then measure on warm cache): **31 % of the gap is "head start" (cache cold-start), 69 % is mechanism (routing intelligence on warm cache)**. The gap survives realistic-production warm conditions.
 * **Cross-benchmark transfer** (LMBenchmark): same ordering, same multiplicative ablation.
 
+## "Does the connector fix work under TP > 1?"
+
+Yes, and TP changes nothing on the wire. The side-table + event emission all live on the single scheduler (one per job regardless of TP); `OffloadKey`s and the payload are content/request-derived, i.e. TP-invariant. There's **no all-gather** — each rank memcpy's its own shard GPU→CPU in parallel, and the scheduler just waits for all `num_workers` acks (`pending_count → 0`) before emitting **one** `BlockStored`. It's an ack barrier, not a data merge. Full derivation in `PRESENTATION.md` → Appendix A.
+
 ## Upstream proposal
 
 Three commits to land, **two existing-flag default changes** to propose:

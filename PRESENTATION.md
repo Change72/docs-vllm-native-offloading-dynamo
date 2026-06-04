@@ -655,4 +655,62 @@ These add to ~4–5 pp, putting the prediction within ~1 pp of the measured 7.60
 >
 > **The routing layer is essentially solved for this workload.** The remaining performance to be reclaimed lives elsewhere — vLLM's per-step batching schedule, decode-attention kernel efficiency, network bandwidth between Frontend and workers, etc. (See §6.9 for the next-bottleneck analysis.)
 
+---
+
+## Appendix A — Does the side-table fix work under tensor parallelism (TP > 1)?
+
+**Short answer: yes, and TP changes nothing about the events on the wire.** This is the most common question reviewers raise, so it's worth being precise about *why* the fix is TP-agnostic and dispelling one specific misconception — that the workers somehow "gather" their shards into one contiguous CPU block before the event fires. They don't.
+
+### A.1 The whole mechanism lives on the single scheduler
+
+The `OffloadingConnector` is instantiated with a role. The side-table (`_pending_event_metadata`), the `OffloadingManager`, `_build_store_jobs()` (populate), and `take_events()` (drain) all live on the **scheduler-side** object, of which there is exactly **one** regardless of TP degree:
+
+```python
+# vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
+if role == KVConnectorRole.SCHEDULER:
+    self.connector_scheduler = OffloadingConnectorScheduler(spec)   # one instance
+elif role == KVConnectorRole.WORKER:
+    self.connector_worker = OffloadingConnectorWorker(spec)         # one per TP rank
+```
+
+TP=8 spins up 8 *workers* (each owning a KV-head shard) but still only one *scheduler*. So there is one side-table, populated once per offload key and drained once per emitted event. TP cannot duplicate or race the side-table.
+
+### A.2 The key and the payload are TP-invariant
+
+`OffloadKey` is a content hash (`block_hash ‖ group_idx`) — identical across all ranks, because the KV *content* a block represents is the same logical content on every shard. The payload we snapshot (`token_ids`, `parent_block_hash`, `block_size`, `lora_name`) all come from **request-level** state on the scheduler, which has no notion of TP sharding. So the `BlockStored` event a downstream router receives is byte-for-byte the same whether TP is 1 or 8 — and that's exactly what we want, because the router indexes *logical* blocks, not per-rank shards.
+
+### A.3 What actually gets "gathered" is acks, not data
+
+The misconception worth heading off: there is **no all-gather, no cross-rank collective, no contiguous "reassembled" CPU block**. Each rank independently DMA-copies *its own* GPU shard to *its own* host buffer (`vllm/v1/kv_offload/cpu/gpu_worker.py`, `SingleDirectionOffloadingHandler` — a plain device→host memcpy per rank, allocated per rank). The 8 copies run in parallel and never talk to each other. The logical block ends up **sharded across 8 host buffers** (rank *r* holds shard *r*); it is never materialized as one contiguous host block.
+
+What the scheduler waits for is **completion acknowledgements**. A store job starts with `pending_count = num_workers` and decrements as each rank reports done; only when all ranks have acked does it call `complete_store` exactly once:
+
+```python
+# vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+job_status.pending_count -= count
+if job_status.pending_count > 0:
+    continue
+assert job_status.pending_count == 0
+...
+if job_status.is_store:
+    self.manager.complete_store(job_status.keys, req_status.req_context)   # appends ONE event
+```
+
+`complete_store` appends a single `OffloadingEvent(removed=False)`, which `take_events()` then turns into a single `BlockStored`. So the correct mental model of the timeline is an **ack barrier**, not a data merge:
+
+```
+  rank 0 ─ GPU→CPU memcpy (shard 0) ─┐
+  rank 1 ─ GPU→CPU memcpy (shard 1) ─┤
+   ...        (parallel, no comm)    ├─► all N acks received ─► complete_store() ─► 1 BlockStored
+  rank 7 ─ GPU→CPU memcpy (shard 7) ─┘   (pending_count → 0)      (one event)
+```
+
+### A.4 "But what about packing F blocks into one chunk?"
+
+The only place anything is "combined into a bigger block" is `block_size_factor > 1`, which packs `F` *consecutive* GPU blocks of a **single rank** along the *sequence* dimension into one larger CPU page (`cpu_page_size = gpu_page_size × block_size_factor`). That is intra-rank packing along time, entirely orthogonal to TP's cross-rank head sharding — and this PR only supports `factor == 1`, so even that packing does not occur on the supported path (see §2.3 for the chunk-offload follow-up).
+
+### A.5 Takeaway
+
+TP > 1 only affects the worker-side data plane (more parallel shard copies) and the completion accounting (`pending_count = num_workers`, which already existed before this PR). Neither touches the scheduler-side side-table or the emitted payload. The fix is correct for any TP degree; its real limitations (`factor > 1`, sliding-window/hybrid groups, multimodal `extra_keys`) are functional scopes orthogonal to parallelism, not TP bugs.
+
 

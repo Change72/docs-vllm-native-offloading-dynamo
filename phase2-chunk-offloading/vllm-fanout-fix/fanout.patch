@@ -1,0 +1,77 @@
+--- /home/changg/workspace/.tmp/llmd_4way/patched_scheduler.py	2026-06-03 23:44:36.283794290 +0000
++++ /home/changg/workspace/.tmp/llmd_4way/fanout_scheduler.py	2026-06-04 00:25:08.436481596 +0000
+@@ -876,13 +876,12 @@
+ 
+                     offloaded_block_idx = start_block_idx + idx
+ 
+-                    # Only the 1:1 full-attention shape has complete
+-                    # self-describing events in this patch.
+-                    if (
+-                        block_size_factor == 1
+-                        and group_config.hash_block_size_factor == 1
+-                        and group_config.sliding_window_size_in_blocks is None
+-                    ):
++                    # Full-attention groups emit self-describing events. For
++                    # grouped offloading (hash_block_size_factor > 1) the chunk
++                    # is fanned out into its constituent hash-blocks so the event
++                    # stays block-granular for downstream routers. Sliding-window
++                    # / SSM groups still fall back to the placeholder payload.
++                    if group_config.sliding_window_size_in_blocks is None:
+                         event_meta = self._build_event_metadata(
+                             req, group_config, offloaded_block_idx
+                         )
+@@ -1088,22 +1087,34 @@
+         group_config: GroupOffloadConfig,
+         offload_block_idx: int,
+     ) -> _OffloadEventMetadata | None:
+-        """Snapshot the KV cache event payload for one offload key.
++        """Snapshot the KV cache event payload for one offloaded chunk.
+ 
+-        Returns None when metadata is incomplete so take_events can fall
++        The chunk is fanned out into its ``hash_block_size_factor`` constituent
++        hash-blocks: ``block_hashes`` carries one engine hash per constituent
++        block, ``token_ids`` carries the whole chunk, and ``block_size`` is the
++        per-constituent-block token count. Downstream routers re-split
++        ``token_ids`` by ``block_size`` and recover every block (not just the
++        chunk tail). For ``hash_block_size_factor == 1`` this is exactly one
++        block. Returns None when metadata is incomplete so take_events can fall
+         back to the existing placeholder behavior.
+         """
+-        if offload_block_idx < 0 or offload_block_idx >= len(req.block_hashes):
++        hbf = group_config.hash_block_size_factor
++        # per-constituent-block token count (= the GPU/hash block size)
++        sub_block_size = group_config.offloaded_block_size // hbf
++        # chunk c covers hash-blocks [c*hbf, (c+1)*hbf)
++        first_hash_idx = offload_block_idx * hbf
++        last_hash_idx = first_hash_idx + hbf
++        if first_hash_idx < 0 or last_hash_idx > len(req.block_hashes):
+             return None
+-        block_hash = req.block_hashes[offload_block_idx]
+-        if block_hash is None:
++        block_hashes = list(req.block_hashes[first_hash_idx:last_hash_idx])
++        if any(h is None for h in block_hashes):
+             return None
+ 
+         parent_block_hash: BlockHash | None
+-        if offload_block_idx == 0:
++        if first_hash_idx == 0:
+             parent_block_hash = None
+         else:
+-            parent_block_hash = req.block_hashes[offload_block_idx - 1]
++            parent_block_hash = req.block_hashes[first_hash_idx - 1]
+             if parent_block_hash is None:
+                 return None
+ 
+@@ -1120,10 +1131,10 @@
+             lora_name = req.lora_request.name
+ 
+         return _OffloadEventMetadata(
+-            block_hashes=[block_hash],
++            block_hashes=block_hashes,
+             parent_block_hash=parent_block_hash,
+             token_ids=token_ids,
+-            block_size=group_config.offloaded_block_size,
++            block_size=sub_block_size,
+             lora_id=lora_id,
+             lora_name=lora_name,
+             extra_keys=None,

@@ -1,0 +1,38 @@
+
+LLMDPROBE ===== factor=1 nBlocks=6 nTokens=96 blockSize=16 =====
+2026-06-03T23:28:46Z	INFO	Starting sharded event processing pool	{"workers": 1}
+LLMDPROBE published GPU BlockStored: 6 hashes, 96 tokens, block_size=16
+LLMDPROBE published CPU BlockStored (placeholder): 6 hash(es) [0xb10c0000 0xb10c0001 0xb10c0002 0xb10c0003 0xb10c0004 0xb10c0005], token_ids=[], block_size=0
+LLMDPROBE published GPU BlockRemoved: 6 hashes (GPU tier evicted)
+2026-06-03T23:28:46Z	LEVEL(-5)	BlockStored extra_features	{"podIdentifier": "vllm-pod1", "hasExtraKeys": false, "parsedBlockCount": 0, "nonNilBlocks": 0, "numTokens": 96, "numEngineKeys": 6}
+2026-06-03T23:28:46Z	LEVEL(-5)	kvblock.InMemoryIndex.Add	added pods to key	{"requestKey": "9540012594951042066", "pods": [{"PodIdentifier":"vllm-pod1","DeviceTier":"gpu","Speculative":false}]}
+2026-06-03T23:28:46Z	LEVEL(-5)	kvblock.InMemoryIndex.Add	added pods to key	{"requestKey": "16921089685996993662", "pods": [{"PodIdentifier":"vllm-pod1","DeviceTier":"gpu","Speculative":false}]}
+2026-06-03T23:28:46Z	LEVEL(-5)	kvblock.InMemoryIndex.Add	added pods to key	{"requestKey": "1342399872045281493", "pods": [{"PodIdentifier":"vllm-pod1","DeviceTier":"gpu","Speculative":false}]}
+2026-06-03T23:28:46Z	LEVEL(-5)	kvblock.InMemoryIndex.Add	added pods to key	{"requestKey": "14412806440506676804", "pods": [{"PodIdentifier":"vllm-pod1","DeviceTier":"gpu","Speculative":false}]}
+2026-06-03T23:28:46Z	LEVEL(-5)	kvblock.InMemoryIndex.Add	added pods to key	{"requestKey": "12157956504292006694", "pods": [{"PodIdentifier":"vllm-pod1","DeviceTier":"gpu","Speculative":false}]}
+2026-06-03T23:28:46Z	LEVEL(-5)	kvblock.InMemoryIndex.Add	added pods to key	{"requestKey": "1040321297494662211", "pods": [{"PodIdentifier":"vllm-pod1","DeviceTier":"gpu","Speculative":false}]}
+2026-06-03T23:28:46Z	LEVEL(-5)	BlockStored extra_features	{"podIdentifier": "vllm-pod1", "hasExtraKeys": false, "parsedBlockCount": 0, "nonNilBlocks": 0, "numTokens": 0, "numEngineKeys": 6}
+2026-06-03T23:28:46Z	LEVEL(-5)	kvblock.InMemoryIndex.Add	added pods to key	{"requestKey": "9540012594951042066", "pods": [{"PodIdentifier":"vllm-pod1","DeviceTier":"cpu","Speculative":false}]}
+2026-06-03T23:28:46Z	LEVEL(-5)	kvblock.InMemoryIndex.Add	added pods to key	{"requestKey": "16921089685996993662", "pods": [{"PodIdentifier":"vllm-pod1","DeviceTier":"cpu","Speculative":false}]}
+2026-06-03T23:28:46Z	LEVEL(-5)	kvblock.InMemoryIndex.Add	added pods to key	{"requestKey": "1342399872045281493", "pods": [{"PodIdentifier":"vllm-pod1","DeviceTier":"cpu","Speculative":false}]}
+2026-06-03T23:28:46Z	LEVEL(-5)	kvblock.InMemoryIndex.Add	added pods to key	{"requestKey": "14412806440506676804", "pods": [{"PodIdentifier":"vllm-pod1","DeviceTier":"cpu","Speculative":false}]}
+2026-06-03T23:28:46Z	LEVEL(-5)	kvblock.InMemoryIndex.Add	added pods to key	{"requestKey": "12157956504292006694", "pods": [{"PodIdentifier":"vllm-pod1","DeviceTier":"cpu","Speculative":false}]}
+2026-06-03T23:28:46Z	LEVEL(-5)	kvblock.InMemoryIndex.Add	added pods to key	{"requestKey": "1040321297494662211", "pods": [{"PodIdentifier":"vllm-pod1","DeviceTier":"cpu","Speculative":false}]}
+2026-06-03T23:28:46Z	LEVEL(-5)	kvblock.InMemoryIndex.Evict	evicted pods from key	{"requestKey": "9540012594951042066", "engineKey": "2970353664", "pods": [{"PodIdentifier":"vllm-pod1","DeviceTier":"gpu","Speculative":false}]}
+2026-06-03T23:28:46Z	LEVEL(-5)	kvblock.InMemoryIndex.Evict	evicted pods from key	{"requestKey": "16921089685996993662", "engineKey": "2970353665", "pods": [{"PodIdentifier":"vllm-pod1","DeviceTier":"gpu","Speculative":false}]}
+2026-06-03T23:28:46Z	LEVEL(-5)	kvblock.InMemoryIndex.Evict	evicted pods from key	{"requestKey": "1342399872045281493", "engineKey": "2970353666", "pods": [{"PodIdentifier":"vllm-pod1","DeviceTier":"gpu","Speculative":false}]}
+2026-06-03T23:28:46Z	LEVEL(-5)	kvblock.InMemoryIndex.Evict	evicted pods from key	{"requestKey": "14412806440506676804", "engineKey": "2970353667", "pods": [{"PodIdentifier":"vllm-pod1","DeviceTier":"gpu","Speculative":false}]}
+2026-06-03T23:28:46Z	LEVEL(-5)	kvblock.InMemoryIndex.Evict	evicted pods from key	{"requestKey": "12157956504292006694", "engineKey": "2970353668", "pods": [{"PodIdentifier":"vllm-pod1","DeviceTier":"gpu","Speculative":false}]}
+2026-06-03T23:28:46Z	LEVEL(-5)	kvblock.InMemoryIndex.Evict	evicted pods from key	{"requestKey": "1040321297494662211", "engineKey": "2970353669", "pods": [{"PodIdentifier":"vllm-pod1","DeviceTier":"gpu","Speculative":false}]}
+2026-06-03T23:28:47Z	LEVEL(-5)	kvblock.InMemoryIndex.Lookup	lookup completed	{"highest-hit-index": 5, "pods-per-key": "1342399872045281493: [vllm-pod1@cpu]\n14412806440506676804: [vllm-pod1@cpu]\n12157956504292006694: [vllm-pod1@cpu]\n1040321297494662211: [vllm-pod1@cpu]\n9540012594951042066: [vllm-pod1@cpu]\n16921089685996993662: [vllm-pod1@cpu]\n"}
+LLMDPROBE --- per-block lookup (after GPU eviction) ---
+LLMDPROBE   block 0 reqKey=9540012594951042066 pods=[{vllm-pod1 cpu false}] cpu=true gpu=false
+LLMDPROBE   block 1 reqKey=16921089685996993662 pods=[{vllm-pod1 cpu false}] cpu=true gpu=false
+LLMDPROBE   block 2 reqKey=1342399872045281493 pods=[{vllm-pod1 cpu false}] cpu=true gpu=false
+LLMDPROBE   block 3 reqKey=14412806440506676804 pods=[{vllm-pod1 cpu false}] cpu=true gpu=false
+LLMDPROBE   block 4 reqKey=12157956504292006694 pods=[{vllm-pod1 cpu false}] cpu=true gpu=false
+LLMDPROBE   block 5 reqKey=1040321297494662211 pods=[{vllm-pod1 cpu false}] cpu=true gpu=false
+LLMDPROBE ===== RESULT factor=1: cpu_lit_blocks=6/6  contiguous_cpu_match_from_start=6/6  => FULL CPU prefix matched (llm-d can route to CPU cache) =====
+
+2026-06-03T23:28:47Z	INFO	Shutting down event processing pool...
+2026-06-03T23:28:47Z	INFO	event processing pool shut down.

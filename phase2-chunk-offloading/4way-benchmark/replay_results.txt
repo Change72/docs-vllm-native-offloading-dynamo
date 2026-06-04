@@ -1,0 +1,24 @@
+LLMDPROBE ===== REPLAY /home/changg/workspace/.tmp/llmd_4way/runs/base_byblock/capture.jsonl =====
+LLMDPROBE frames=352  GPU_stored_events=335  CPU_stored_events=69  removed_events=0
+LLMDPROBE total CPU engine-hashes emitted by vLLM = 1334
+LLMDPROBE GPU-cached canonical blocks (distinct) = 1392
+LLMDPROBE CPU-matchable canonical blocks         = 1334  (coverage = 95.8%)
+LLMDPROBE longest single prefix = 68 blocks; contiguous CPU match from start = 68
+LLMDPROBE ===== REPLAY /home/changg/workspace/.tmp/llmd_4way/runs/base_chunk/capture.jsonl =====
+LLMDPROBE frames=347  GPU_stored_events=336  CPU_stored_events=70  removed_events=0
+LLMDPROBE total CPU engine-hashes emitted by vLLM = 443
+LLMDPROBE GPU-cached canonical blocks (distinct) = 1392
+LLMDPROBE CPU-matchable canonical blocks         = 443  (coverage = 31.8%)
+LLMDPROBE longest single prefix = 68 blocks; contiguous CPU match from start = 0
+LLMDPROBE ===== REPLAY /home/changg/workspace/.tmp/llmd_4way/runs/patched_byblock/capture.jsonl =====
+LLMDPROBE frames=334  GPU_stored_events=335  CPU_stored_events=1334  removed_events=0
+LLMDPROBE total CPU engine-hashes emitted by vLLM = 1334
+LLMDPROBE GPU-cached canonical blocks (distinct) = 1392
+LLMDPROBE CPU-matchable canonical blocks         = 1334  (coverage = 95.8%)
+LLMDPROBE longest single prefix = 68 blocks; contiguous CPU match from start = 68
+LLMDPROBE ===== REPLAY /home/changg/workspace/.tmp/llmd_4way/runs/patched_chunk/capture.jsonl =====
+LLMDPROBE frames=325  GPU_stored_events=332  CPU_stored_events=439  removed_events=0
+LLMDPROBE total CPU engine-hashes emitted by vLLM = 439
+LLMDPROBE GPU-cached canonical blocks (distinct) = 1383
+LLMDPROBE CPU-matchable canonical blocks         = 439  (coverage = 31.7%)
+LLMDPROBE longest single prefix = 64 blocks; contiguous CPU match from start = 0

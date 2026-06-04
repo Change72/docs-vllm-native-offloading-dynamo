@@ -13,8 +13,13 @@ placeholder events and dropped by routers.
   → [`step1-verify-chunk-offload-fact.md`](step1-verify-chunk-offload-fact.md)
   - Harness (self-contained, reusable for Step 2): `run_offline.py`,
     `instrumented_clean_scheduler.py`.
-- **Step 2 — Dynamo / llm-d comparison** (next): how each stack handles chunk offloading, and a
-  same-geometry / same-workload A/B on prefix recovery + TTFT.
+- **Step 2 — llm-d cannot match the chunk** (done): on real multi-turn traffic, upstream chunk
+  offloading drops llm-d's contiguous CPU match from 68/68 → 0/68.
+  → [`step2-llmd-cannot-match-chunk.md`](step2-llmd-cannot-match-chunk.md)
+- **Step 3 — vLLM fix, llm-d matches the chunk** (done): vLLM publishes one tail hash + the whole
+  chunk's `token_ids` + per-block `block_size`; llm-d's existing 1:many path lights every block,
+  restoring 94.3% coverage / 68/68 contiguous for both store and remove. vLLM-side only.
+  → [`step3-vllm-fix-llmd-matches-chunk.md`](step3-vllm-fix-llmd-matches-chunk.md)
 
 ## Step 1 one-liner
 

@@ -38,6 +38,38 @@ because they are non-contiguous the router's prefix match dies at block 0.
    over the GPU-cached prefix space how many canonical blocks are CPU-matchable (coverage) and the
    contiguous CPU run along the longest single prefix (the routing-relevant signal).
 
+## Picture: what's offloaded vs. what the router is told (factor=3)
+
+```
+prefix, in 16-token GPU/hash blocks:
+   block:   B0    B1    B2  │ B3    B4    B5  │ B6    B7    B8
+   hash:    h0    h1    h2  │ h3    h4    h5  │ h6    h7    h8
+            └──── chunk 0 ──┘ └──── chunk 1 ──┘ └──── chunk 2 ──┘
+
+CPU data actually stored (every block's KV lives in CPU RAM):
+            ███   ███   ███   ███   ███   ███   ███   ███   ███
+
+CPU BlockStored events vLLM emits — ONE per chunk, the TAIL hash only:
+   emitted: ·     ·    h2     ·     ·    h5     ·     ·    h8
+   missing: h0    h1   ▲      h3    h4   ▲      h6    h7   ▲
+            (no event for the first factor-1 blocks of every chunk ⇒
+             the router never learns a key for them)
+```
+
+```
+Request arrives. The router rebuilds per-block keys r0..r8 and walks the
+prefix CONTIGUOUSLY from block 0, stopping at the first block with no CPU entry:
+
+   r0(h0) ─► no CPU entry ✗ ─► STOP.     contiguous CPU match = 0
+
+Even the FIRST chunk fails: its leading factor-1 blocks (h0,h1) were never
+announced, so block 0 misses and the walk dies immediately — the tail hashes
+that *were* announced (h2,h5,h8) sit behind a hole and are never reached.
+```
+
+A list of `factor` hashes is offloaded per chunk, but only the **last** hash gets an event, so the
+router can match **nothing** from the start of the prefix.
+
 ## Why chunk fails (code-grounded)
 
 - vLLM's chunk CPU `BlockStored` carries **one tail hash per chunk** (= the chunk's last GPU block

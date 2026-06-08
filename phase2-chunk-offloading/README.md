@@ -20,6 +20,15 @@ placeholder events and dropped by routers.
   chunk's `token_ids` + per-block `block_size`; llm-d's existing 1:many path lights every block,
   restoring 94.3% coverage / 68/68 contiguous for both store and remove. vLLM-side only.
   → [`step3-vllm-fix-llmd-matches-chunk.md`](step3-vllm-fix-llmd-matches-chunk.md)
+- **Step 4 — Dynamo lower-tier index study** (done): the *other* router. Native CPU offload lands in
+  Dynamo's `LowerTierIndexer`, a `(parent_seq_hash, local_hash) → child_seq_hash` continuation chain;
+  the study ends with 7 constraints any chunk-mode integration must satisfy.
+  → [`step4-dynamo-lower-tier-index.md`](step4-dynamo-lower-tier-index.md)
+- **Step 5 — final design: expose chunks as N per-block events (Plan B)** (done): against Step 4's
+  constraints, the minimum-mutation plan is for vLLM to emit the chunk's `factor` constituent per-block
+  hashes + whole-chunk tokens (+ a removal side table). Both llm-d and Dynamo consume it with **zero
+  router changes**. Supersedes Step 3's Plan A once Dynamo is in scope.
+  → [`step5-final-design.md`](step5-final-design.md)
 
 ## Step 1 one-liner
 

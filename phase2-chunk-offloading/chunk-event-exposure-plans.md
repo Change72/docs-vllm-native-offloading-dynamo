@@ -306,3 +306,86 @@ So for plain aligned by-block the mapping is essentially **identity (redundant)*
 only for **Plan A's chunk removal** and **cross-engine translation**. Corollary: in `E3 → [R0,R1,R2,R3]`,
 alignment makes `R3 == E3`, so the mapping really just stores the `R0,R1,R2` the tail hash alone can't
 regenerate — which is exactly why a single-tail `BlockRemoved` needs it.
+
+### Dynamo side: what Plan A requires (code-located)
+Dynamo's KV router (`lib/kv-router`) has the same architecture as llm-d — a local hash computed from
+tokens (xxh3, `protocols.rs`) plus an external→local reverse map — but **both are 1:1 today**, so
+Plan A needs two changes.
+
+**Current state:**
+- **Conversion is 1:1** (`zmq_wire/convert.rs`): `create_stored_blocks` is driven by
+  `block_hashes.len()` — `num_block_tokens = vec![block_size; block_hashes.len()]`, and the loop takes
+  `block_size` tokens **per external hash**, computing one local `tokens_hash` each. It does **not**
+  split by `len(token_ids)/block_size` the way llm-d's pool does.
+- **The external→local map is 1:1** (`indexer/concurrent_radix_tree.rs`):
+  `type WorkerLookup = FxHashMap<ExternalSequenceBlockHash, SharedBlock>` — one external hash → **one**
+  node, not a `Vec`. The radix tree's children are keyed by `tokens_hash` (local, prefix-chained);
+  `WorkerLookup` is the external→node reverse lookup used for O(1) removal (`apply_removed` removes one
+  node per external hash). This is the map "I remembered" — confirmed **1:1, not a list**.
+
+**Changes needed for Plan A (mirror of llm-d's 1:many):**
+1. **Conversion 1:1 → 1:many** (`create_stored_blocks`): when the event is "1 tail hash + N·block_size
+   tokens, `block_size` = per-block size", drive the loop by **token length** (`len(token_ids) /
+   kv_block_size`), split the whole token stream into N canonical blocks, compute a prefix-chained
+   `tokens_hash` per block, and associate **all N** with the single external tail hash. (Today it
+   would take only the first `block_size` tokens → 1 block, mispair the tail hash with block 0's local
+   hash, and drop the rest.)
+2. **`WorkerLookup` 1:1 → 1:many**: `FxHashMap<ExternalSequenceBlockHash, SharedBlock>` →
+   `… Vec<SharedBlock>>` (or equivalent), so a single-tail `BlockRemoved` evicts all N nodes. **This is
+   the "is the local side a list?" question — currently no; Plan A needs it to be.**
+
+**Two gotchas:**
+- `create_stored_blocks` breaks/skips when `num_tokens != kv_block_size` (`convert.rs`). Plan A's
+  `block_size` = per-block size = `kv_block_size`, so no conflict — but that logic currently means
+  "emit one block per hash", so the core edit is to make it slice by token length instead.
+- `apply_stored` warns `"block_hash mismatch: sequence hashes should be uniform across workers"`
+  (`concurrent_radix_tree.rs`): a given `tokens_hash` is expected to map to a consistent external hash.
+  Under chunk 1:many the same prefix could appear by-block (per-block hashes) on one path and chunked
+  (all tail hash) on another → may trip this; evaluate whether to relax it.
+
+**llm-d ↔ Dynamo mapping of the change:** llm-d infers 1:many from the `len(eng):len(req)` ratio in
+`index.Add` + a one-to-many `engineToRequestKeys`; Dynamo needs the equivalent — slice by token length
+in `create_stored_blocks` + turn `WorkerLookup` into one-to-many.
+
+### Dynamo side: implemented (what landed)
+Branch `feat/kv-router-chunked-offload-1many` (pushed to the fork). The 1→N expansion lives partly in
+the converter and partly in the index, mirroring llm-d.
+
+**1. Converter fan-out** (`zmq_wire/convert.rs`). `create_stored_blocks` now detects a chunked event
+(`num_canonical = token_ids.len() / kv_block_size > block_hashes.len()`) and calls a new
+`create_stored_blocks_fanout`: it re-splits the whole token stream into `kv_block_size` blocks,
+computes each block's local `tokens_hash`, and maps **all of them to the single chunk-tail external
+hash** (ratio `block_hashes[i * m / num_canonical]`, identical to llm-d). The 1:1 path is untouched
+(normal events have one hash per block ⇒ `num_canonical == block_hashes.len()` ⇒ branch not taken).
+
+**2. External→node lookup is now 1:many** in all three trees:
+- `radix_tree.rs` (single) and `concurrent_radix_tree.rs`: `Ext → node` → `Ext → Vec<node>`. Store
+  appends; parent resolution uses `.last()` (the chunk tail); a single-tail `BlockRemoved` drops
+  **all** nodes under that hash.
+- `concurrent_radix_tree_compressed`: `edge_index` already keeps the **last** position per hash
+  (right for lookup/parent), so only `remove_worker_for_hash` changed — it truncates coverage at the
+  **first** edge position carrying the hash, uncovering the whole chunk.
+
+**3. 1:many-safe self-reference check.** The old "reuse-node-by-external-hash" trick (which also
+detected cycles) is incompatible with chunks (many blocks share a hash), so it was removed and
+replaced by an explicit check: reject a store only if a block's hash equals the event's `parent_hash`
+(a true cycle). Chunk blocks never trip this (their tail hash ≠ the previous chunk's tail).
+
+**4. Safety guards for the unsupported cases** (chunked offload supports text / full-attention only):
+- **Non-full-attention** (sliding-window / SSM / mamba): already dropped by the normalizer/filter
+  (`is_main_attention`) before `convert_event` — no change needed.
+- **Multimodal (mm)**: the fan-out cannot distribute per-sub-block extra_keys, so a chunked event
+  carrying mm (`block_mm_infos`) is **dropped + warned** in `create_stored_blocks`. The 1:1 path still
+  handles mm correctly.
+- **`cache_salt` / `prompt_embeds`**: not visible to the router (discarded in deserialize), so they
+  cannot be guarded on the Dynamo side — must be handled vLLM-side.
+
+**Production path:** `convert_event` (`zmq_wire`) → `emit()` (`publisher/sinks.rs`) →
+`indexer.apply_event_with_buffer` → backend tree `apply_event` (→ `apply_stored` / `apply_removed`).
+
+**Validation:** a cross-impl Plan-A chunk test (`indexer/tests.rs`; runs on single / concurrent /
+compressed: 1 tail hash → all `factor` blocks matchable → single-tail remove evicts all) + an
+integration test driving the real converter + tree (`tests/chunk_plan_a.rs`); full suite **479 lib +
+2 integration tests green**. End-to-end on a real vLLM multi-turn capture with eviction: 328 CPU
+removes drop coverage 94.3% → 5.1% and contiguous 68 → 16 (the surviving 16 = the hot shared prefix),
+confirming chunk store **and** remove are applied.

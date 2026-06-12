@@ -288,8 +288,8 @@ The Rust worker selector (`lib/kv-router/src/scheduling/selector.rs`) scores eac
 
 ```
 overlap_credit_blocks = device_overlap_blocks       * 1.0   // overlap_score_credit, configurable
-                      + host_pinned_overlap_blocks  * 0.75  // host_cache_hit_weight, hardcoded
-                      + disk_overlap_blocks         * 0.25  // disk_cache_hit_weight, hardcoded
+                      + host_pinned_overlap_blocks  * 0.75  // host_cache_hit_weight, configurable by my PR #10368
+                      + disk_overlap_blocks         * 0.25  // disk_cache_hit_weight, configurable by my PR #10368
                       + shared_overlap_blocks       * shared_cache_multiplier
 
 adjusted_prefill_blocks = max(raw_prefill_blocks - overlap_credit_blocks, 0)

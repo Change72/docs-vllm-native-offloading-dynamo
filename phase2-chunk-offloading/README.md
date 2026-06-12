@@ -29,6 +29,34 @@ placeholder events and dropped by routers.
   hashes + whole-chunk tokens (+ a removal side table). Both llm-d and Dynamo consume it with **zero
   router changes**. Supersedes Step 3's Plan A once Dynamo is in scope.
   → [`step5-final-design.md`](step5-final-design.md)
+- **Step 6 — E2E verification + the overlapping-chunk eviction hazard** (done): Plan-B store AND
+  remove verified end-to-end on real traffic with real CPU evictions against both routers'
+  production index code (llm-d 71/71 + 516/516; Dynamo 11/11 after a 1-line batch-abort fix).
+  Surfaced, measured, and fixed the overlapping-chunk hazard: a shared prefix not aligned to
+  `offloaded_block_size` makes sibling boundary chunks re-list the same block hashes, so the first
+  sibling's eviction (a) aborted Dynamo's removal batch → leaked edges (fixed in Dynamo: skip
+  absent hashes) and (b) truncated every other sibling's router-side CPU match while vLLM could
+  serve them. A vLLM-side per-hash removal refcount was built and verified (3/3 restored on the
+  surviving sibling), but per the team decision the shipped producer is **plain fan-out** and
+  consumers deduplicate — Dynamo's standard deployment already runs an `EventDedupFilter`
+  (ai-dynamo/dynamo#8012) with exactly the needed refcount semantics; the refcount/exactly-once
+  producer variants are archived on `feature/offloading-events-exactly-once`. Known limitation:
+  filter-less single-entry consumers (e.g. llm-d today) drop a shared block on the first
+  sibling's eviction (under-credit only, never corruption).
+  → [`step6-e2e-overlapping-chunk-eviction.md`](step6-e2e-overlapping-chunk-eviction.md)
+  ([中文版](step6-e2e-overlapping-chunk-eviction.zh-CN.md))
+
+- **Step 7 — real dynamo serve + vLLM e2e, metrics-verified.**
+  Single L4: vLLM (chunked offload `factor=3`, opt-in self-describing events, 128 MB CPU pool
+  with real LRU evictions) behind a real dynamo frontend (`--router-mode kv`) and worker
+  publisher (EventDedupFilter in the path), zero external services (file discovery / TCP request
+  plane / ZMQ event plane). Router `kv_cache_events_applied` reconciles **exactly** against a
+  sidecar wire capture: stored 685 = 331 GPU + 354 CPU, removed 24, zero warnings. Found and
+  fixed a metrics-wiring gap on the way (lower-tier indexers built without a metrics handle —
+  dynamo `db0ec356`), plus a pitfall list (stale maturin binding, `--kv-events-config` must be
+  explicit, which counter is whose).
+  → [`step7-dynamo-vllm-real-e2e.md`](step7-dynamo-vllm-real-e2e.md)
+  ([中文版](step7-dynamo-vllm-real-e2e.zh-CN.md))
 
 ## Step 1 one-liner
 

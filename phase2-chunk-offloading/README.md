@@ -29,20 +29,16 @@ placeholder events and dropped by routers.
   hashes + whole-chunk tokens (+ a removal side table). Both llm-d and Dynamo consume it with **zero
   router changes**. Supersedes Step 3's Plan A once Dynamo is in scope.
   → [`step5-final-design.md`](step5-final-design.md)
-- **Step 6 — E2E verification + the overlapping-chunk eviction hazard** (done): Plan-B store AND
-  remove verified end-to-end on real traffic with real CPU evictions against both routers'
-  production index code (llm-d 71/71 + 516/516; Dynamo 11/11 after a 1-line batch-abort fix).
-  Surfaced, measured, and fixed the overlapping-chunk hazard: a shared prefix not aligned to
-  `offloaded_block_size` makes sibling boundary chunks re-list the same block hashes, so the first
-  sibling's eviction (a) aborted Dynamo's removal batch → leaked edges (fixed in Dynamo: skip
-  absent hashes) and (b) truncated every other sibling's router-side CPU match while vLLM could
-  serve them. A vLLM-side per-hash removal refcount was built and verified (3/3 restored on the
-  surviving sibling), but per the team decision the shipped producer is **plain fan-out** and
-  consumers deduplicate — Dynamo's standard deployment already runs an `EventDedupFilter`
-  (ai-dynamo/dynamo#8012) with exactly the needed refcount semantics; the refcount/exactly-once
-  producer variants are archived on `feature/offloading-events-exactly-once`. Known limitation:
-  filter-less single-entry consumers (e.g. llm-d today) drop a shared block on the first
-  sibling's eviction (under-credit only, never corruption).
+- **Step 6 — E2E verification + the overlapping-chunk eviction hazard** (done): Plan-B store and
+  remove were verified on real traffic with real CPU evictions, and the replay isolated the key
+  hazard: when a shared prefix is not aligned to `offloaded_block_size`, sibling boundary chunks
+  can legitimately re-list the same per-block hash. The shipped vLLM producer therefore remains
+  **plain fan-out** and does not try to make removals exactly-once per hash. Correct consumers must
+  ref-count or deduplicate duplicate announcements. Dynamo's standard deployment already has the
+  required semantics in the worker publisher's `EventDedupFilter` (ai-dynamo/dynamo#8012), so the
+  lower-tier indexer sees the filtered stream. The exploratory Dynamo batch-abort and vLLM
+  exactly-once producer variants are not part of the current merge path; they are retained only as
+  diagnostic/archival evidence.
   → [`step6-e2e-overlapping-chunk-eviction.md`](step6-e2e-overlapping-chunk-eviction.md)
   ([中文版](step6-e2e-overlapping-chunk-eviction.zh-CN.md))
 
@@ -57,6 +53,19 @@ placeholder events and dropped by routers.
   explicit, which counter is whose).
   → [`step7-dynamo-vllm-real-e2e.md`](step7-dynamo-vllm-real-e2e.md)
   ([中文版](step7-dynamo-vllm-real-e2e.zh-CN.md))
+
+## Merge validation plan
+
+The L4 Step 7 run is the fast real-stack proof that the event contract works with genuine CPU
+evictions. For the cluster validation, treat **factor=16** as the canonical chunk setting and run a
+small correctness-focused sweep rather than repeating the Stage 1 performance matrix:
+
+- factor control: `1` and `16` (optionally `8` if scheduling time allows)
+- CPU pressure: normal pool plus a small pool that forces real CPU evictions
+- prefix alignment: aligned shared prefix and non-aligned shared prefix
+- success criteria: no CPU placeholders, chunk store `n_hashes == factor`, CPU removes observed,
+  `kv_cache_events_applied` reconciles with wire capture after `EventDedupFilter`, and zero
+  lower-tier `BlockNotFound` / warning logs
 
 ## Step 1 one-liner
 

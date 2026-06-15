@@ -1,12 +1,22 @@
 # vLLM × Dynamo CPU Tier Integration — Diagnosis, Fix, Benchmarks
 
-> ## ➡️ STAGE 3 (latest): chunk offloading is now router-matchable
-> Chunked CPU offload (`block_size_factor > 1`) used to be invisible to KV-cache-aware routers.
-> A **vLLM-side-only** fix (now on the existing PR, branch
-> `bugfix/offloading-connector-blockstored-payload` @ `54044fad4`) makes it **fully matchable on
-> llm-d — 94.3% coverage, 68/68 contiguous, store + remove**. Status, readiness matrix, and the
-> remaining plan (Dynamo 1:many, `extra_keys`, sliding-window/SSM) are the **plan of record**:
-> **→ [`STAGE3-CHUNK-OFFLOADING-PLAN.md`](STAGE3-CHUNK-OFFLOADING-PLAN.md)**
+> ## Latest: Stage 2 chunk offloading is end-to-end visible to Dynamo
+> Chunked CPU offload (`block_size_factor > 1`) used to be invisible to KV-cache-aware routers
+> because vLLM's CPU-tier events were placeholders. The current vLLM PR
+> ([vllm-project/vllm#43468](https://github.com/vllm-project/vllm/pull/43468),
+> `66273a27d`) implements opt-in self-describing events for native `OffloadingConnector`,
+> including chunk mode: each CPU chunk store carries all constituent per-block hashes and the
+> whole-chunk token span. The matching Dynamo PR
+> ([ai-dynamo/dynamo#10368](https://github.com/ai-dynamo/dynamo/pull/10368),
+> `db0ec356`) accepts vLLM's `medium="CPU"` as `HostPinned` and wires lower-tier
+> `kv_cache_events_applied` metrics.
+>
+> The shipped producer is intentionally **plain fan-out**. Overlapping chunk stores/removes can
+> repeat the same per-block hash on the wire; Dynamo's standard worker publisher path already
+> runs `EventDedupFilter`, which provides the needed per-worker/tier refcount semantics before
+> events reach the lower-tier indexer. See
+> [`phase2-chunk-offloading/step7-dynamo-vllm-real-e2e.md`](phase2-chunk-offloading/step7-dynamo-vllm-real-e2e.md)
+> for the L4 real-stack proof.
 
 This repo contains the writeup, plots, raw data, deployment artifacts, and orchestration
 scripts for the nscale B200 work on enabling vLLM's `OffloadingConnector` (CPU KV-cache
@@ -62,11 +72,12 @@ Full write-up in [`PRESENTATION.md`](PRESENTATION.md); Slack-friendly TL;DR in
     └── run-{sweep,phase3,phase4,phase5,retry,rr-extra}.sh    Phase scripts
 ```
 
-## Three commits that this work depends on
+## PRs / commits that this work depends on
 
-* **vLLM `e074f0a`** — populate full `BlockStored` event payload (`token_ids`, `block_size`, `parent_block_hash`) from a side-table maintained by `OffloadingConnectorScheduler`
+* **vLLM `66273a27d`** — opt-in self-describing `OffloadingConnector` KV events, including chunk mode (`factor > 1`) with constituent per-block hashes, whole-chunk `token_ids`, per-block `block_size`, and remove fan-out metadata retained until eviction
 * **Dynamo `6c2a73a`** — accept `"CPU"` as an alias for the `HostPinned` tier so vLLM events match the indexer's medium-name expectations
 * **Dynamo `5b7725f`** — surface `kv_cache_events_applied` counters on Prometheus so the new CPU-tier traffic is observable end-to-end
+* **Dynamo `db0ec356`** — pass that metrics handle into lazily created lower-tier indexers; without this wiring HostPinned events are applied correctly but stay absent from `/metrics`
 
 See `PRESENTATION.md` §2 for the diagnosis, §3 for the diff against `llm-d` and commit
 details, §5 for the cost-function deep-dive, §6 for the benchmarks (incl. §6.4 for the

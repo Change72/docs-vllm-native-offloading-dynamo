@@ -9,12 +9,13 @@
 **Root cause** is in three layers (full diagnosis in §2):
 1. **[Easy]** Medium-name mismatch (`"CPU"` vs `"CPU_PINNED"`) → events fall into the Device tier as default
 2. **[Complex]** Connector emits BlockStored events without `token_ids` / `block_size` / `parent_block_hash` → Dynamo cannot rebuild its radix tree → silent drop
-3. **[Next phase]** When vLLM's *group offload* mode is enabled (`block_size_factor > 1`), a single offload event covers multiple GPU blocks under a single hash → Dynamo cannot align its block-level index. Disabled by default in vLLM; **explicitly out of scope for this work**, scheduled as a follow-up.
+3. **[Stage 2: done]** When vLLM's *group/chunk offload* mode is enabled (`block_size_factor > 1`), one CPU offload chunk covers multiple GPU/hash blocks. The current vLLM PR fixes this by making each chunk event self-describing: one `BlockStored` carries all constituent per-block hashes, the whole chunk's `token_ids`, and the per-block `block_size`. Duplicate overlapping chunk announcements are left to consumers to ref-count/dedup; Dynamo's standard path already does this with `EventDedupFilter`.
 
 **Solution.**
-* vLLM `e074f0a` — populate full `BlockStored` payload from a side-table in `OffloadingConnectorScheduler`
+* vLLM `66273a27d` — opt-in self-describing `OffloadingConnector` KV events, including chunk mode (`factor > 1`)
 * Dynamo `6c2a73a` — accept `"CPU"` as an alias for the `HostPinned` tier
 * Dynamo `5b7725f` — plumb `kv_cache_events_applied` counters into the lower-tier indexer so the new CPU-tier traffic is observable on Prometheus
+* Dynamo `db0ec356` — wire the metrics handle into lazily created lower-tier indexers so production HostPinned traffic is counted
 
 **Headline result** at production saturation; **3 cold-start repeats, mean ± std**.
 
@@ -143,17 +144,19 @@ Dynamo needs these fields for three concrete reasons:
 
 **Effect.** A `BlockStored` with `block_size=0` is dropped at the indexer layer. The lower-tier index stays permanently empty. The router's cost function then has nothing to credit a worker for, and CPU-tier hits are invisible — both to routing decisions and to dashboards.
 
-### 2.3 Issue 3 — Group / chunk offload  *[Out of scope; next phase]*
+### 2.3 Issue 3 — Group / chunk offload  *[Stage 2 addressed]*
 
 vLLM has an optional optimization where the `OffloadingSpec` can use a `block_size_factor > 1` and a `hash_block_size_factor > 1`, batching multiple GPU blocks into one offload "chunk" to reduce I/O count and metadata size. In that mode:
 
-* one offload `BlockStored` event covers `F` GPU blocks (typically F = 2 or 4)
+* one offload `BlockStored` event covers `F` GPU blocks (the production-oriented sweep should center on F = 16; the L4 correctness run used F = 3 to force quick evictions)
 * the event uses the **last** GPU block's hash as its key
 * GPU-side events still come at GPU-block granularity
 
 Dynamo's radix tree is at GPU-block granularity. Without expansion logic on the connector side, a single chunk event lands as a single radix node spanning `F × block_size` tokens — and none of the intermediate prefix matches anything else in the tree. *[llm-d also suffers from this.]*
 
-**Status.** Group offloading is **disabled by default** in vLLM today. This work targets the common `factor == 1` path and explicitly preserves the placeholder fallback for `factor > 1`. **This is the next phase of the work**, planned as a follow-up patch on the connector.
+**Status.** Stage 1 fixed the by-block (`factor == 1`) path. Stage 2 extends the same self-describing contract to chunk mode: the connector emits one CPU chunk event that carries the chunk's constituent per-block hashes, whole-chunk tokens, per-block `block_size`, parent hash, LoRA metadata, and group/cache-spec metadata. The feature is opt-in via `kv_connector_extra_config["self_describing_kv_events"]` and remains inert unless vLLM KV cache events are enabled.
+
+The producer intentionally does **plain fan-out**, not exactly-once per-hash removals. If two non-aligned sibling chunks list the same shared block hash, that duplicate store/remove appears on the wire. Dynamo's standard worker publisher path runs `EventDedupFilter`, which ref-counts those duplicate announcements before lower-tier indexing. Filter-less consumers must implement equivalent refcount/dedup semantics or accept conservative under-credit on overlapping chunk evictions.
 
 ---
 
@@ -169,7 +172,7 @@ Two natural places to hold the missing payload:
 | How it's populated | when `_build_store_jobs()` runs, while request + KV-group context are still in scope | when a GPU `BlockStored` event arrives, before its CPU counterpart |
 | How it's consumed | drained inside `take_events()` to emit complete `BlockStored` payloads on the wire | looked up when the CPU `BlockStored` arrives, then merged in-memory |
 | Works for other frameworks (SGLang, FlexKV…) | ❌ each framework would need its own connector-side patch | ✅ one router-side table works for everyone |
-| Works under group/chunk offload (factor > 1) | ✅ trivial to extend (we own both sides of the boundary) | ❌ Dynamo cannot reconstruct the per-GPU-block parent chain from the chunk-level CPU event alone |
+| Works under group/chunk offload (factor > 1) | ✅ implemented in Stage 2 for native `OffloadingConnector`; the producer emits all constituent per-block hashes and whole-chunk tokens | ❌ Dynamo cannot reconstruct the per-GPU-block parent chain from a placeholder chunk event alone |
 | Works under third-party re-hashing | ✅ we control the hash function on the source side | ❌ if a connector re-hashes (e.g., LMCache, FlexKV mid-pipeline), the GPU and CPU hashes disagree and the lookup misses |
 | Works without LoRA in the hash function | ✅ we explicitly carry `lora_name` | ❌ assumes hash(token_ids+lora_name) — true for vLLM, not guaranteed for other engines |
 | Survives reordering (CPU `BlockStored` before GPU `BlockRemoved`) | ✅ data lives next to the producer | ⚠️ requires TTL to mitigate the race shown below |
@@ -201,40 +204,34 @@ We chose **approach A**: the connector-side side-table. It's a slightly larger v
 
 ### 3.2 The three commits
 
-#### Commit 1 — vLLM: `[BugFix][kv_offload] Populate BlockStored payloads for OffloadingConnector KV events`
+#### Commit 1 — vLLM: `[feature][kv_offload] Self-describing KV events for OffloadingConnector`
 
 Branch: `Change72/vllm` → `bugfix/offloading-connector-blockstored-payload`
 Upstream PR: <https://github.com/vllm-project/vllm/pull/43468>
 
-Key idea: an `OrderedDict[OffloadKey, BlockEventMeta]` is maintained inside `OffloadingConnectorScheduler`. It is populated during `_build_store_jobs()` while we still have the request and the KV-cache-group context (and therefore `token_ids`, `parent_block_hash`, `block_size`, optional `lora_name`). At `take_events()` time, the side-table is drained and each `BlockStored` event is emitted with its full payload.
+Key idea: `OffloadingConnector` records event metadata while it still has the request and KV-cache-group context. For by-block mode the metadata describes one GPU/hash block. For chunk mode it describes one offloaded CPU chunk and carries all constituent per-block hashes plus the whole chunk's token span. At `take_events()` time, each completed store emits a complete `BlockStored`; the metadata is retained until CPU eviction so the later `BlockRemoved` can fan out the same constituent hashes.
 
 ```python
-# In _build_store_jobs (sketch):
-for i, key in enumerate(new_offload_keys):
-    tokens = req.all_token_ids[i * B : (i + 1) * B]
-    parent = req.block_hashes[i * hbf - 1] if i > 0 else None
-    self._pending_event_metadata[key] = BlockEventMeta(
-        block_hashes=[key.local_hash],
-        block_size=B,
-        token_ids=tokens,
-        parent_block_hash=parent,
-        lora_name=req.lora_request.name if req.lora_request else None,
-    )
+# Store metadata is built before the async copy loses request context.
+first_hash_idx = offload_block_idx * hash_block_size_factor
+chunk_hashes = req.block_hashes[first_hash_idx:first_hash_idx + hash_block_size_factor]
+token_ids = req.all_token_ids[first_hash_idx * block_size:
+                              (first_hash_idx + hash_block_size_factor) * block_size]
 
-# In take_events:
-for ev in self._manager.take_events():
-    if isinstance(ev, OffloadingEvent) and not ev.removed:
-        for key in ev.keys:
-            meta = self._pending_event_metadata.pop(key, None)
-            if meta:
-                yield BlockStored(**meta.as_payload(), medium=ev.medium)
-            else:
-                yield BlockStored(block_hashes=[key.local_hash], medium=ev.medium)   # legacy fallback
+# The later event is self-describing. In chunk mode this is one event carrying
+# multiple constituent per-block hashes, not one placeholder tail-hash event.
+BlockStored(
+    block_hashes=chunk_hashes,
+    parent_block_hash=req.block_hashes[first_hash_idx - 1] if first_hash_idx else None,
+    token_ids=token_ids,
+    block_size=block_size,   # per GPU/hash block, not whole chunk
+    medium="CPU",
+)
 ```
 
-Scope is intentionally narrow: full-attention groups with `block_size_factor == 1 == hash_block_size_factor`. Sliding-window groups, group offload (`factor > 1`), and multimodal `extra_keys` fall through to the pre-patch placeholder behavior — the patch *adds* the populate-then-drain path, it never makes any existing path worse. **188 lines changed in `scheduler.py`; 358 lines of unit tests pinning every wire-format field a router cares about.**
+Scope: full-attention groups for native `OffloadingConnector`, including `block_size_factor > 1` chunk mode. Sliding-window groups keep the legacy placeholder fallback. Multimodal/cache-salt/prompt-embedding `extra_keys` still require care: the schema has room for them, but this PR should be treated as validated for plain token-hash workloads unless those extra-key paths are explicitly tested.
 
-Removal events delete the side-table entry; we also add a TTL hook (unused today, sized for completeness) so that store-jobs which never complete don't leak.
+Duplicate overlapping chunks are not deduplicated by the vLLM producer. Consumers that index by per-block hash must ref-count/dedup duplicate announcements. Dynamo's standard worker-side publisher path already provides this through `EventDedupFilter`.
 
 #### Commit 2 — Dynamo: `kv-router: accept "CPU" as alias for HostPinned tier on KV event ingest`
 
@@ -288,8 +285,8 @@ The Rust worker selector (`lib/kv-router/src/scheduling/selector.rs`) scores eac
 
 ```
 overlap_credit_blocks = device_overlap_blocks       * 1.0   // overlap_score_credit, configurable
-                      + host_pinned_overlap_blocks  * 0.75  // host_cache_hit_weight, configurable by my PR #10368
-                      + disk_overlap_blocks         * 0.25  // disk_cache_hit_weight, configurable by my PR #10368
+                      + host_pinned_overlap_blocks  * 0.75  // host_cache_hit_weight, configurable in router config
+                      + disk_overlap_blocks         * 0.25  // disk_cache_hit_weight, configurable in router config
                       + shared_overlap_blocks       * shared_cache_multiplier
 
 adjusted_prefill_blocks = max(raw_prefill_blocks - overlap_credit_blocks, 0)
@@ -707,10 +704,9 @@ if job_status.is_store:
 
 ### A.4 "But what about packing F blocks into one chunk?"
 
-The only place anything is "combined into a bigger block" is `block_size_factor > 1`, which packs `F` *consecutive* GPU blocks of a **single rank** along the *sequence* dimension into one larger CPU page (`cpu_page_size = gpu_page_size × block_size_factor`). That is intra-rank packing along time, entirely orthogonal to TP's cross-rank head sharding — and this PR only supports `factor == 1`, so even that packing does not occur on the supported path (see §2.3 for the chunk-offload follow-up).
+The only place anything is "combined into a bigger block" is `block_size_factor > 1`, which packs `F` *consecutive* GPU blocks of a **single rank** along the *sequence* dimension into one larger CPU page (`cpu_page_size = gpu_page_size × block_size_factor`). That is intra-rank packing along time, entirely orthogonal to TP's cross-rank head sharding. Stage 2 supports this by describing the chunk as a logical bundle of its constituent per-block hashes and whole-chunk tokens; downstream routers still index at GPU/hash-block granularity.
 
 ### A.5 Takeaway
 
-TP > 1 only affects the worker-side data plane (more parallel shard copies) and the completion accounting (`pending_count = num_workers`, which already existed before this PR). Neither touches the scheduler-side side-table or the emitted payload. The fix is correct for any TP degree; its real limitations (`factor > 1`, sliding-window/hybrid groups, multimodal `extra_keys`) are functional scopes orthogonal to parallelism, not TP bugs.
-
+TP > 1 only affects the worker-side data plane (more parallel shard copies) and the completion accounting (`pending_count = num_workers`, which already existed before this PR). Neither touches the scheduler-side event metadata or the logical payload. The fix should be correct for any TP degree; the remaining limitations are functional scopes such as sliding-window/hybrid groups and multimodal/cache-salt/prompt-embedding `extra_keys`, not TP bugs.
 

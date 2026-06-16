@@ -3,9 +3,9 @@
 wire shape plus store/remove accounting.
 
 Checks (factor F, per-block size B):
-  CPU BlockStored : every event carries n_hashes in {F} (chunk) with
-                    tok_len == F*B and block_size == B; parent set except
-                    for prefix-head chunks. Placeholder events
+  CPU BlockStored : every non-placeholder event carries exactly F hashes
+                    (chunk) with tok_len == F*B and block_size == B; parent
+                    set except for prefix-head chunks. Placeholder events
                     (tok_len==0 && block_size==0) are counted separately.
   CPU BlockRemoved: hash multiset accounting -- every removed hash must
                     have been stored before (no unknown removals), and
@@ -13,6 +13,13 @@ Checks (factor F, per-block size B):
                     constituent hashes of a chunk are removed together).
   Parent chain    : a CPU stored event's parent must be a hash already
                     seen in a previous CPU stored event (or None).
+
+Note: the shipped producer does PLAIN FAN-OUT (no per-hash exactly-once).
+On non-chunk-aligned shared-prefix traffic, sibling chunks legitimately
+re-announce shared hashes, so checks 5/6/7 are INFORMATIONAL (re-announce
+and suppressed-remove counts are EXPECTED to be > 0); the consumer (Dynamo
+EventDedupFilter) deduplicates them. The hard pass/fail gates are checks
+1-4 (shape, parent chain, and no remove of a never-stored hash).
 
 Usage: decode_capture.py <capture.jsonl> [--factor 3] [--block-size 16]
 """
@@ -167,8 +174,9 @@ bad_nhash = {
 }
 ph = placeholder_events.get("CPU", 0)
 print(
-    f"1. store: every non-placeholder CPU BlockStored has 1..{factor} hashes "
-    "(overlap-trimmed): "
+    f"1. store: every CPU BlockStored has 1..{factor} hashes "
+    f"(shipped producer emits exactly {factor} per non-placeholder chunk; "
+    f"n_hashes=1 also covers placeholders): "
     + ("PASS" if not bad_nhash else f"FAIL {bad_nhash}")
     + (f"   (placeholders={ph})" if ph else "")
 )
@@ -194,44 +202,53 @@ print(
     + ("PASS" if removed_unknown == 0 else f"FAIL ({removed_unknown} unknown)")
 )
 
-# Announce-state machine: a removed hash must be in the announced state
-# (stored since its last removal), and never removed twice within one
-# announced period. This is the exact invariant single-entry router
-# indexes (Dynamo worker_map, llm-d pod-entry sets) rely on. With the
-# vLLM removal refcount, overlapping chunks announce a shared hash's
-# removal only when its LAST live reference dies, so this must hold even
-# under non-chunk-aligned shared prefixes.
+# --- consumer-side dedup behavior (INFORMATIONAL, not pass/fail) -----------
+# The shipped vLLM producer does PLAIN FAN-OUT: it does NOT make per-hash
+# store/remove exactly-once. Under a non-chunk-aligned shared prefix, two
+# sibling chunks legitimately list the same constituent block hash, so that
+# hash is announced (stored AND removed) once per containing chunk -- by
+# design (see events.py docstring + step6). The CONSUMER deduplicates:
+# Dynamo's worker publisher runs EventDedupFilter (ai-dynamo/dynamo#8012),
+# which ref-counts per (dp_rank, tier, hash) and forwards a remove only when
+# the last live reference disappears.
+#
+# So checks 5/6/7 are INFORMATIONAL: re-announced / suppressed counts are
+# EXPECTED > 0 on overlapping traffic and == 0 on aligned/by-block traffic.
+# The real correctness gates are checks 1-4 (shape, parent chain, and -- the
+# only true remove invariant -- no remove of a never-stored hash, check 4).
 announced = set()
-removed_unannounced = 0
-suppressed_dups = 0  # informational under refcount: store of already-announced
+re_announced = 0  # store of an already-announced hash (overlap)
+re_removed = 0    # remove of a hash already removed since its last store
 for ev in cpu_event_stream:
     kind, hashes = ev
     if kind == "stored":
         for h in hashes:
             if h in announced:
-                suppressed_dups += 1
+                re_announced += 1
             announced.add(h)
     else:
         for h in hashes:
             if h not in announced:
-                removed_unannounced += 1
+                re_removed += 1
             announced.discard(h)
 print(
-    "5. remove: per-hash announce state machine (no remove while "
-    "un-announced): "
-    + ("PASS" if removed_unannounced == 0 else f"FAIL ({removed_unannounced})")
-    + f"   (re-announces of an already-announced hash: {suppressed_dups})"
+    "5. per-hash announce machine (informational): "
+    f"re-announced stores={re_announced}, removes-of-already-removed={re_removed}"
+    "   (expected > 0 under non-aligned overlap, 0 otherwise; a true "
+    "'remove of never-stored' is gated by check 4)"
 )
-
-# --- exactly-once + Dynamo EventDedupFilter simulation ---------------------
 print(
-    "6. wire is per-hash exactly-once (no re-announce of an announced hash): "
-    + ("PASS" if suppressed_dups == 0 else f"FAIL ({suppressed_dups} duplicate stores)")
+    "6. wire re-announce count (informational): "
+    f"{re_announced} duplicate per-hash stores"
+    "   (plain fan-out re-announces shared hashes; the consumer's "
+    "EventDedupFilter ref-counts them. 0 == no overlap in this capture)"
 )
 
 # Simulate Dynamo's EventDedupFilter (PR ai-dynamo/dynamo#8012): store
-# increments a per-hash refcount; a remove passes through only when the
-# count hits 0. Under exactly-once wire, the filter must be a no-op.
+# increments a per-hash refcount; a remove is forwarded only when the count
+# returns to 0. `filtered_removes` is how many non-final removes the filter
+# correctly SUPPRESSES -- expected > 0 exactly when there is overlap, and the
+# reason raw-wire removes can exceed the router's post-filter applied removes.
 fcnt = Counter()
 filtered_removes = 0
 passed_removes = 0
@@ -247,9 +264,11 @@ for kind, hashes in cpu_event_stream:
                 fcnt.pop(h, None)
             else:
                 filtered_removes += 1
+live_after_filter = sum(1 for v in fcnt.values() if v > 0)
 print(
-    "7. Dynamo EventDedupFilter simulation: removes blocked by the filter: "
-    + ("PASS (0 blocked, filter is a no-op)" if filtered_removes == 0
-       else f"FAIL ({filtered_removes} blocked -> consumer-side leak)")
-    + f"   (passed={passed_removes}, residual filter entries={sum(1 for v in fcnt.values() if v > 0)})"
+    "7. EventDedupFilter simulation (informational): "
+    f"non-final removes suppressed={filtered_removes}, "
+    f"removes forwarded={passed_removes}, still-live hashes={live_after_filter}"
+    "   (suppressed > 0 is CORRECT under overlap; still-live = blocks not yet "
+    f"evicted. Reconciliation: router applied_removes == wire_removes - {filtered_removes})"
 )

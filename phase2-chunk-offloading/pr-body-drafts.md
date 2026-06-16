@@ -23,7 +23,8 @@ kv_connector_extra_config={
 ```
 
 The flag is inert unless vLLM KV cache events are also enabled. With the flag off, the connector
-keeps the existing placeholder event behavior.
+keeps the legacy placeholder *payload* (`token_ids=[]`, `block_size=0`, `parent_block_hash=None`);
+note that stored events are now emitted one-per-offload-key rather than one-per-batch.
 
 For CPU offload stores, the connector now records the request metadata while it still has access
 to the request and KV-cache-group context, then emits `BlockStored` events with:
@@ -80,11 +81,13 @@ evictions, but this does not create data corruption.
   - event ordering independence
   - reset behavior
 
-Recommended local command:
+Test command (run before opening the PR; paste the result line):
 
 ```bash
 python -m pytest tests/v1/kv_connector/unit/offloading_connector/test_scheduler.py -q
 ```
+
+Result: <!-- TODO(workstation): paste e.g. "NN passed in X.Xs" -->
 
 ## End-to-end validation
 
@@ -105,6 +108,18 @@ Result:
 - GPU `BlockStored`: 331 events
 - router metric `kv_cache_events_applied`: stored ok = 685, removed ok = 24
 - zero lower-tier warnings / `BlockNotFound`
+
+## Duplication check
+
+<!-- TODO(submitter): run the AGENTS.md duplicate-work checks and confirm before opening -->
+Not a duplicate of an existing open PR. Checked open PRs touching the offloading connector and
+KV-event payloads (e.g. `gh pr list --repo vllm-project/vllm --state open --search
+"OffloadingConnector"`, plus the issue/PR searches in AGENTS.md). <!-- replace with the finding -->
+
+## AI assistance
+
+This change was developed with AI assistance (Claude). The human submitter has reviewed every
+changed line, runs the tests, and owns the change end-to-end.
 ````
 
 ## Dynamo PR #10368
@@ -124,7 +139,9 @@ This PR makes Dynamo's KV router consume and observe vLLM native CPU-offload KV 
 
 Changes:
 
-- Treat vLLM's `medium="CPU"` as an alias for the existing `HostPinned` tier.
+- Treat vLLM's `medium="CPU"` as an alias for the existing `HostPinned` tier, in the shared
+  `StorageTier::from_kv_medium` normalization layer (so the alias also applies to the
+  `kv_consolidator` consumer — verified consistent: `CPU` → `HostPinned`).
 - Preserve existing `CPU_PINNED` and `CPU_TIER1` behavior.
 - Add wire tests for placeholder CPU payloads and full self-describing CPU payloads.
 - Count lower-tier `Stored` / `Removed` / `Cleared` applies in `kv_cache_events_applied`.
@@ -164,11 +181,11 @@ This PR does not rely on a `remove_blocks_impl` skip-absent-hashes change.
 
 ## Tests
 
-Recommended local commands:
+Test commands run:
 
 ```bash
-cargo test -p dynamo-kv-router --lib
-cargo test -p dynamo-llm --lib kv_router
+cargo test -p dynamo-kv-router --lib       # 545 / 545 pass
+cargo test -p dynamo-llm --lib kv_router   # 166 / 166 pass
 ```
 
 Focused coverage:

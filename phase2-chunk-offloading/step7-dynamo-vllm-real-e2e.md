@@ -140,8 +140,13 @@ filtered, zero conversion failures), and the worker log has zero
 
 `applied` counts **events**; the dedup filter's per-hash interception inside a batch does not
 change event counts. The hash-level filter semantics (a shared hash's non-final removal is
-held back) are covered by the filter's own unit tests and by the simulation in
-[`decode_capture.py`](dynamo-e2e/decode_capture.py) check 7.
+held back) are proven by the `EventDedupFilter`'s own unit tests — **not** by this run. The
+sidecar is the **pre-dedup** raw wire while `kv_cache_events_applied` is the **post-filter**
+count, so the exact removed match (24 == 24) holds precisely *because the filter suppressed
+nothing here*: in this capture [`decode_capture.py`](dynamo-e2e/decode_capture.py) check 7 was
+a no-op (0 removes suppressed), since the traffic did not evict an overlapping boundary chunk.
+Under the Step 6 non-aligned-prefix hazard, post-filter applied removes would be fewer than
+raw-wire removes by design, and the reconciliation becomes `applied == wire − suppressed`.
 
 ## Pitfalls hit on the way (read before reproducing)
 

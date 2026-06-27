@@ -1,391 +1,292 @@
-# Chunk Offloading — KV-Event Exposure: Problems, Fix Plans & Roadmap
+# Stage 2 — Self-describing KV events under chunk offload (`factor > 1`)
 
-## Part 1 — How llm-d matches the CPU tier today (engineKey → requestKey)
-
-### 1.1 Two-level index
-`InMemoryIndex` keeps **two** maps:
-
-- `data: requestKey → PodCache` — which pods × device-tiers hold each *canonical* block; this is what
-  `Lookup` matches on.
-- `engineToRequestKeys: engineKey → []requestKey` — an LRU from an engine's own block hash to the
-  canonical request key(s) it covers.
-
-### 1.2 Request keys come from tokens; engine keys are the raw event hashes
-On a `BlockStored`, the pool derives the keys it indexes from the event's **tokens**:
-
-```go
-// pool.go
-requestKeys, _ := p.tokenProcessor.TokensToKVBlockKeys(
-    parentRequestKey, ev.Tokens, effectiveModelName, extraFeatures)
-```
-
-llm-d's `requestKey` is **built to reproduce vLLM's block hash**. See Appendix.
-
-`requestKeys` are canonical / content-addressed (prefix-chained) — **any client can recompute them
-from tokens**. `engineKeys` are just the raw hashes carried in the event. `index.Add` then records
-both `data[requestKey] += podEntry` and `engineToRequestKeys[engineKey] = requestKeys`.
-
-### 1.3 The location-only path (events *without* tokens)
-If an event carries **no tokens**, the pool can't compute request keys, so it falls back to resolving
-each engine hash against the *existing* map:
-
-```go
-// handleDeviceTierUpdate  (used when len(requestKeys) == 0)
-for _, ek := range engineKeys {
-    rk, err := p.index.GetRequestKey(ctx, ek)   // needs a PRE-EXISTING mapping
-    ...
-}
-```
-
-This path is only a *reference* into the mapping built by earlier (token-carrying) events — it cannot
-create new canonical keys.
-
-### 1.4 Lifecycle — when is `engineToRequestKeys` evicted? (it is bounded)
-Two removal paths:
-
-1. **Explicit** (`Evict`, `EngineKey` case): a `BlockRemoved(engineKey)` drops the pod entries from its
-   request keys; when **all** are empty → `engineToRequestKeys.Remove(key)`.
-2. **LRU capacity**: it is an LRU (`Size`, default `1e8`) → the oldest entry is dropped when full.
-
-The explicit path only fires on a `BlockRemoved`, so keys whose backend never emits a remove (crash,
-a tier that doesn't publish removals) linger — **the LRU is the real backstop, not the explicit
-removal**. Without it the map would grow unbounded. (Bounded, but the default cap is large and there
-are *two* such LRUs incl. `data`; size them to your memory.)
+> **Scope of this doc.** Proves the Stage-1 self-describing contract extends *correctly* to
+> production-sized chunk offload (`block_size_factor = 16`), that the overlapping-chunk duplicate
+> hazard is handled with no premature eviction, and that chunk mode preserves routing quality vs
+> by-block (`factor = 1`) while reducing offload I/O. **Not** a perf-win story — that is Stage 1.
+>
+> Shared background (the bug, the router cost function, the 8×B200 perf sweep, deploy setup) lives in
+> the Stage-1 whitepaper [`../../PRESENTATION.md`](../../PRESENTATION.md); this doc references it and
+> does not re-derive it.
 
 ---
 
-## Part 2 — Why chunking breaks current llm-d (without `token_ids`)
+## 1. TL;DR
 
-### 2.1 What a chunk is
-With `block_size_factor > 1`, vLLM groups `factor` GPU blocks into one CPU chunk
-(`offloaded_block_size = block_size × factor`) for larger / fewer transfers. Internally each chunk is
-keyed by a **single** OffloadKey = the chunk's **tail block hash** (block hashes are prefix-chained,
-so the tail uniquely identifies the chunk's content). At eviction the manager hands back only that
-**tail** key.
-
-### 2.2 The upstream chunk event tells the router almost nothing
-Upstream, a chunk's CPU `BlockStored` is a placeholder: **one tail hash, `token_ids=[]`,
-`block_size=0`**. With no tokens, it can only take the location-only path (§1.3) and resolve that one
-tail hash via the alias — so at most the **tail block** of each chunk gets a CPU entry. The other
-`factor-1` blocks of the chunk are **never announced** and have **no mapping at all**.
-
-### 2.3 A new request therefore matches nothing
-A new request recomputes **per-block** request keys `r0 … r_{N-1}` from its tokens (the router works
-at the canonical block size). It then walks the prefix **contiguously** and stops at the first block
-with no CPU entry. Block 0 of the first chunk (`r0`) was never announced → miss → the contiguous CPU
-match dies at **0**, even though most of the chunk's KV physically sits in CPU RAM. Measured on real
-multi-turn traffic: by-block `factor=1` = **68/68** contiguous, chunk `factor=3` = **0/68**.
-
-### 2.4 Conclusion
-Current llm-d **cannot match a chunk** unless the event lets the router reconstruct the chunk's
-**per-block** canonical keys. The only self-contained way to do that is to carry the chunk's
-`token_ids` (the router re-splits them into per-block keys). This is the primary reason to put
-`token_ids` in the event (self-containedness, §1.5, is a secondary bonus).
-
-## Picture: what's offloaded vs. what the router is told (factor=3)
-
-```
-prefix, in 16-token GPU/hash blocks:
-   block:   B0    B1    B2  │ B3    B4    B5  │ B6    B7    B8
-   hash:    h0    h1    h2  │ h3    h4    h5  │ h6    h7    h8
-            └──── chunk 0 ──┘ └──── chunk 1 ──┘ └──── chunk 2 ──┘
-
-CPU data actually stored (every block's KV lives in CPU RAM):
-            ███   ███   ███   ███   ███   ███   ███   ███   ███
-
-CPU BlockStored events vLLM emits — ONE per chunk, the TAIL hash only:
-   emitted: ·     ·    h2     ·     ·    h5     ·     ·    h8
-   missing: h0    h1   ▲      h3    h4   ▲      h6    h7   ▲
-            (no event for the first factor-1 blocks of every chunk ⇒
-             the router never learns a key for them)
-```
-
-```
-Request arrives. The router rebuilds per-block keys r0..r8 and walks the
-prefix CONTIGUOUSLY from block 0, stopping at the first block with no CPU entry:
-
-   r0(h0) ─► no CPU entry ✗ ─► STOP.     contiguous CPU match = 0
-
-Even the FIRST chunk fails: its leading factor-1 blocks (h0,h1) were never
-announced, so block 0 misses and the walk dies immediately — the tail hashes
-that *were* announced (h2,h5,h8) sit behind a hole and are never reached.
-```
-
-A list of `factor` hashes is offloaded per chunk, but only the **last** hash gets an event, so the
-router can match **nothing** from the start of the prefix.
+- Stage 1 fixed the by-block (`factor=1`) self-describing path; Stage 2 extends the **same contract**
+  to chunk mode: one CPU `BlockStored` carries the chunk's **`F` constituent per-block hashes**, the
+  **whole-chunk `token_ids`**, per-block `block_size`, parent hash, LoRA + group metadata.
+- **What this doc establishes (all validated — §4/§5):**
+  1. `F=16` event shape + reconciliation is correct (`n_hashes==16`, `len(token_ids)==256`, zero
+     placeholders, router applies all stored/removed events with 0 errors) — §4.1, and at scale §5.1.
+  2. Overlapping (non-aligned) chunks produce duplicate store/remove on the wire, and the consumer
+     ref-counts them so **no block is evicted while a sibling chunk still references it** — §4.2.
+  3. `F=16` serving perf ≈ `F=1` at **~24× fewer offload *store* events** (the removed-event row is
+     ~2× fewer, so total applied KV events ≈2.4× fewer) — §5.2.
+- **Deferred / out of scope:** sliding-window groups keep the legacy placeholder fallback;
+  `extra_keys` (multimodal / cache-salt / prompt-embedding) paths are not validated here.
 
 ---
 
-## Part 3 — Fix plans at a glance
+## 2. What chunk mode changes  *(distilled from Stage-1 §2.3/§3 and [step6](step6-e2e-overlapping-chunk-eviction.md))*
 
-> The 1→N expansion has to live **somewhere** under the chunk mode. Plan A keeps it in the **router** as
-> `E3 → [R0,R1,R2,R3]` (engineKey → requestKeys). Plans B/C keep the *equivalent* map in **vLLM** as
-> `H3 → [H0,H1,H2,H3]` (chunk-tail hash → constituent hashes) for removal fan-out. Same 1:many,
-> different side.
-
-| Plan | Wire / chunk | Router change | vLLM change | Self-contained / restart-safe | extra_keys | Verdict |
-|---|---|---|---|---|---|---|
-| **A** single hash + tokens, router 1:many | 1 hash + N·bs tokens | 1:many `E3→[R0..R3]` (llm-d ✓) | none | ✅ yes | deferred (recompute) | ✅ **now** |
-| **B** list of hashes + tokens (= native batched) | N hashes + tokens | none (native shape) | 1:many map `H3→[H0..H3]` | ✅ yes | deferred | tried, dropped |
-| **C** list of hashes, NO tokens, GPU-resolve + TTL | N hashes | none (1:1 via alias) | 1:many map `H3→[H0..H3]` | ❌ depends on GPU events (External hash -> local hash) | inherited from GPU | not recommended |
-| **D** tail hash, indexer back-derives via block_size | 1 hash | chunk special-case | parent-walk state | ❌ depends on GPU events (External hash -> local hash) | inherited | not recommended |
-| **E** Dynamo dedicated chunk index | (n/a) | chunk-aware index | n/a | n/a | n/a | later / if needed |
+- `OffloadingSpec` with `block_size_factor = F` packs `F` consecutive GPU blocks into one CPU chunk
+  (`cpu_page_size = gpu_page_size × F`) to cut I/O count + metadata.
+- Stage 2 contract: the connector records chunk metadata while request/KV-group context is still in
+  scope, then emits **one self-describing `BlockStored` per chunk** (all `F` per-block hashes + whole
+  chunk tokens). At CPU eviction the matching `BlockRemoved` fans out the **same** `F` hashes.
+- **Plain fan-out, not exactly-once.** If a shared prefix ends mid-chunk, two non-aligned sibling
+  chunks list the same constituent hash → duplicate store/remove on the wire. Consumers indexing at
+  per-block granularity **must ref-count/dedup** (Dynamo `EventDedupFilter`; llm-d equivalent). This
+  is the one behavior by-block mode does not have.
 
 ---
 
-## Part 4 — Fix plans in detail
+## 3. Deploy method (how the F=16 runs are produced)
 
-### Plan A — Single hash + full tokens, router does 1:many  ← current PR
-Event: 1 representative hash (chunk tail) + whole-chunk `token_ids` + `block_size` = **per-block**
-size. The router re-splits tokens into `factor` blocks and maps the one engine hash to all of them —
-the 1:many `E3 → [R0,R1,R2,R3]` lives in the router (see Appendix).
+The cluster's Grove/DGD operator pins dynamo ≤1.2.x, incompatible with the vLLM build this feature
+needs (see [`../../project-b200-chunk-dynamo-version-wall`] / Stage-1 notes) → the DGD path is blocked.
+**Two operator-free deploys are used**, both on image
+`change1472/dynamo-vllm-cpu-offload:stage2-reviewfix-20260619` (dynamo 1.3.0 + vLLM #43468; public),
+command uses **`python3`** (image has no bare `python`).
 
-- **Pros:** Self-contained — no dependency on other events; restart-safe (and immune to the §1.5
-  timing edge, since it re-`Add`s from its own tokens). Smallest of the token-carrying options (1
-  hash/parent, not N). vLLM keeps **zero** extra state — removal sends the same single hash and the
-  router's 1:many evicts all blocks. Indexer sees a **uniform** `block_size` (no chunk awareness, no
-  mixed sizes). Reuses llm-d's existing 1:many.
-- **Cons:** Needs a 1:many mapping in the router (llm-d has it; Dynamo: small addition). Carries
-  tokens (~N token-ids/chunk). `extra_keys` (multimodal / `cache_salt`) deferred.
-- **Why:** Lets the router reconstruct the per-block keys (Part 2) while pushing the 1→N expansion to
-  a generic, lightweight router capability and keeping vLLM state minimal. Verified e2e on llm-d:
-  94.3% coverage, 68/68 contiguous, store + remove.
+**(a) Single-Pod bypass — used for the correctness runs S & B (1 worker).** `frontend` + `worker` as
+two containers in one Pod sharing an `emptyDir` for `DYN_DISCOVERY_BACKEND=file`
+(`DYN_FILE_KV=/shared/dynstore`, `DYN_REQUEST_PLANE=tcp`, `DYN_EVENT_PLANE=zmq`) — no Grove / NATS /
+etcd. GPU: `nvidia.com/gpu:1` + toleration `nvidia.com/gpu Exists:NoSchedule`; `fsGroup:1000`. Model
+loaded from a baked-in / small download (Qwen3-0.6B). Validated identically on L4 + B200 with a
+1-request F=3 smoke (10 stored events, 0 errors) — S/B scale that to F=16.
 
-### Plan B — List of hashes + full tokens (vLLM fan-out = native batched shape)  ← tried, dropped
-Event: 1 event, `block_hashes` = all N constituent hashes + tokens + `block_size` = per-block size
-(identical to vLLM's native GPU batched event).
+**(b) NATS+etcd multi-worker — used for the effectiveness/parity runs A, A′ & the full at-scale run
+(4 workers, Qwen3-32B).** File-discovery doesn't span pods, so multi-worker uses standard operator-free
+dynamo discovery:
+- **In-namespace NATS + etcd** (own instances, *not* another namespace's — that cross-pollutes
+  discovery): NATS `nats:2.11.4` with `jetstream{}` + `max_payload 15 MiB`; etcd
+  `bitnamilegacy/etcd:3.5.18` single-node, `ALLOW_NONE_AUTHENTICATION=yes`.
+- **1 frontend Pod + N worker Pods**, each with `NATS_SERVER=nats://nats.<ns>.svc…:4222` +
+  `ETCD_ENDPOINTS=http://etcd.<ns>…:2379`. `DYN_DISCOVERY_BACKEND` defaults to `etcd`; NATS is the
+  request + event plane (no `file`/`tcp`/`zmq` overrides). vLLM still ZMQ-publishes its KV events on
+  `tcp://*:20080`; the dynamo worker subscribes and re-publishes to the frontend over NATS.
+- **Qwen3-32B from the RWX `model-cache` PVC**, mounted at **`/root/.cache/huggingface`** (where
+  `dynamo_llm::hub` looks) + `HF_HUB_OFFLINE=1` — mounting at the wrong path (or omitting offline)
+  makes `fetch_model` try HuggingFace and **429**. Per-worker GPU `nvidia.com/gpu:1`, mem limit
+  **300 Gi** (the 150 GiB pinned CPU tier + ~61 GB model page-cache OOMs a smaller limit), and
+  **podAntiAffinity 1-per-node** (don't co-locate the big pinned allocations).
+- Workload driven by the vLLM multi-turn client (`benchmarks/multi_turn/`) run **inside the frontend
+  Pod** vs `localhost:8600` (not port-forward — avoids a bandwidth bottleneck on perf numbers).
 
-- **Pros:** Indexer needs **zero** new logic (normal 1:1, N hashes ↔ N token-blocks). Self-contained.
-- **Cons:** vLLM must keep its **own 1:many map** — `H3 → [H0,H1,H2,H3]` (chunk tail → all constituent
-  hashes) — so eviction can fan the removal out to all N (at evict time the manager only has the tail).
-  This is the **same 1:many as Plan A, just relocated**: Plan A keeps `E3 → [R0..R3]` in the router;
-  Plan B keeps `H3 → [H0..H3]` in vLLM. Largest wire.
-- **Why dropped:** The 1:many has to live somewhere; putting it in vLLM is extra per-chunk state for
-  the whole CPU-pool lifetime, whereas Plan A reuses the router's existing 1:many for free.
-
-### Plan C — List of hashes, NO tokens, resolve via GPU events + longer TTL  ← proposed by reviewers
-Event: store/remove send a list of constituent hashes, **no tokens**; the indexer resolves each hash
-via the alias built from earlier GPU events; TTL extended so the alias outlives the CPU reference.
-
-- **Pros:** Smallest wire (hashes only). Indexer needs no chunk awareness. Can sidestep CPU-side
-  `extra_keys` (reuses vLLM's own hashes, which already encode extra_keys).
-- **Cons:** **Not self-contained** — CPU entries resolve only if the GPU-event alias was seen and
-  retained, so it is **restart-unsafe** (a fresh router / new replica has no GPU history) and also
-  exposed to the §1.5 timing edge; "longer TTL" turns this into a tuning knob. And it **still needs the
-  same vLLM-side 1:many map** `H3 → [H0..H3]` (remove sends a list, but evict yields only the tail).
-- **Why not:** Trades self-containedness for a small payload saving; KV events are not the bandwidth
-  bottleneck (KV data transfer is).
-
-### Plan D — Tail hash only; indexer detects chunk via block_size and back-derives
-Event: tail hash + `block_size` = **chunk** size. The indexer infers a chunk and reconstructs the
-constituent blocks (e.g. walk the parent chain back `factor` steps).
-
-- **Pros:** Minimal wire (1 hash).
-- **Cons:** Forces the indexer to **special-case chunks** (mixed block sizes + parent-chain walk) —
-  exactly the complexity reviewers want to avoid. A hash can't be inverted to its siblings without
-  extra state. Same GPU-event dependency as Plan C.
-- **Why not:** Most indexer complexity of all options; contradicts "the indexer shouldn't care about
-  chunking."
-
-### Plan E — Dynamo-side dedicated chunk index  (orthogonal)
-Instead of (or on top of) expanding chunks to block granularity, Dynamo keeps a chunk-aware index, to
-unify chunk concepts across backends (vLLM native, LMCache, KVBM).
-
-- **Pros:** One chunk abstraction across backends; future-proof if multiple chunk sources converge.
-- **Cons:** Heavy; re-introduces chunk awareness into the indexer; more state / maintenance;
-  premature with a single chunk source. Plan A already makes chunking transparent to the index.
-- **Why (later):** Worth it only once ≥2 real chunk sources demonstrate the need for a shared
-  abstraction.
+> CPU-tier sizing matters at F=16: one 256-token offload block ≈ 28 MB (Qwen3-0.6B) / ≈ 64 MB
+> (Qwen3-32B) — far larger than F=3's ~5 MB. Too small a `cpu_bytes_to_use` → `prepare_store` returns
+> `None` (`"cannot store blocks"`, zero CPU stores). S used 2 GiB, B 256 MiB (to force eviction),
+> A/A′/full 150 GiB.
 
 ---
 
-## Part 5 — Recommended roadmap & open concerns
+## 4. Correctness  *(verify-once; not part of any sweep)*
 
-### Roadmap (stages)
-- **Stage 1 (now) — Plan A, text full-attention.** Ship the single-hash + tokens chunk event (on the
-  existing PR). llm-d works today; Dynamo adds the 1:many mapping. Add a small guard so multimodal /
-  `cache_salt` requests fall back to the placeholder until `extra_keys` lands. → unblocks the POC.
-- **Stage 2 — complete the payload.** Fill `extra_keys` (by-block is easy; chunk needs the
-  "one-hash vs per-block extra_keys" contract decision) and wire sliding-window / SSM groups
-  (currently placeholder; needs router-side window/state-aware matching).
-- **Stage 3 — Dynamo dedicated chunk index (Plan E), only if needed.** When a backend-agnostic chunk
-  abstraction (LMCache / KVBM + vLLM) is actually required.
+### 4.1 F=16 reconciliation — aligned prefix  *(run S — DONE 2026-06-23; A re-confirms at scale)*
 
-*(Stage 2 vs 3 can reorder depending on whether multimodal support or multi-backend unification is the
-higher priority.)*
+The F=16 analogue of Stage-1 step7's F=3 result (`685 = 331 GPU + 354 CPU`, n_hashes=3).
 
-### Open concerns / likely challenges
-- **"The token payload isn't small."** True, but normal (by-block) offloading carries tokens too;
-  Plan A is the smallest token-carrying shape, and KV events aren't the bandwidth bottleneck.
-- **"The indexer shouldn't care about chunking" (DLAlgo).** Agreed — Plan A satisfies it: uniform
-  `block_size`, no mixed sizes; the only thing required is the generic 1:many mapping.
-- **"Can we avoid tokens entirely?" (Plans C/D).** Only by giving up self-containedness — a GPU-event
-  dependency + restart fragility (§1.5) — and it still needs the vLLM-side 1:many map anyway.
-- **`extra_keys` (multimodal / `cache_salt`).** Deferred; a correctness caveat shared with the
-  by-block path already on the PR. Guard recommended for Stage 1.
-- **Where the 1:many lives.** It must live somewhere: **A** → router `E3→[R0..R3]` (generic, llm-d has
-  it); **B/C** → vLLM `H3→[H0..H3]` (removal fan-out); **D** → indexer (chunk special-casing). A is the
-  only one that adds nothing new on the vLLM side and nothing chunk-specific on the indexer side.
+**Run S** — Qwen3-0.6B, 1-Pod bypass on B200 `prctr-7wrxm`, image `…:stage2-reviewfix-20260619`,
+offload `block_size=256` (F=16), 8 distinct ~2900-token prompts. ZMQ side-capture decoded with
+`decode_capture.py --factor 16 --block-size 16`; frontend `/metrics` for applied reconciliation.
+
+| check | expected | observed (run S) |
+|---|---|---|
+| CPU `BlockStored` `n_hashes` | `16` | **`16` — all 88 CPU stores (histogram `{16: 88}`)** |
+| CPU `BlockStored` `len(token_ids)` | `256` | **`256` — shape check 2 PASS (`tok_len == 16×16`, `block_size==16`, all events)** |
+| CPU placeholders (`block_size==0` / empty tokens) | `0` | **`0`** |
+| wire stored total | `= GPU + CPU` | **`104 = 16 GPU + 88 CPU`** |
+| `kv_cache_events_applied{stored,ok}` | `= wire stored`, 0 errors | **`104`, all error buckets `0`** |
+| `kv_cache_events_applied{removed,ok}` | `> 0`, 0 errors | **`1196` (1194 GPU + 2 CPU), all error buckets `0`** |
+| CPU `BlockRemoved` constituent hashes | match stored chunk metadata | **PASS — check 4 (no remove of an un-stored hash); removed in whole-chunk groups `{64, 176}` = 4 & 11 chunks ×16** |
+
+Corroborating: `vllm:kv_offload_total_bytes_total{GPU_to_CPU}=2.58 GB`, `kv_offload_size_count{GPU_to_CPU}=8`
+(one offload op/request) — the bytes actually moved, ~29.4 MB per 256-token block. Parent chain check 3
+PASS (`parent=None` on exactly the 8 distinct request heads); the decoder's "out-of-order arrival"
+note is the expected `complete_store` set-iteration artifact, not a failure.
+
+> **F=16 offload-sizing finding (harness, not a contract property).** Offload is *proactive during
+> prefill* — `_build_store_jobs` queues `num_offloadable_tokens // 256` blocks per scheduled request,
+> not on GPU eviction. At F=16 one offload block ≈ **28 MB** for a 0.6B model (vs ~5 MB at F=3), so the
+> Stage-1 smoke's `cpu_bytes_to_use=128 MB` (~4 blocks) is **too small** — a single ~2900-token request
+> wants to store 11 blocks at once → `prepare_store` returns `None` (`"cannot store blocks"`, zero CPU
+> stores). Raising the CPU tier to **2 GiB** (~73 blocks) makes stores succeed; 8 prompts (~88 blocks)
+> overflow it so the tier also evicts → CPU `BlockRemoved`. This is a *workload/sizing* knob for a tiny
+> synthetic smoke; the **event shape is unaffected** by it. (`--num-gpu-blocks-override 288` was also
+> set to add GPU eviction realism but is *not* required for CPU offload.)
+
+### 4.2 Overlap — no premature eviction  *(run B — DONE 2026-06-23, PASS)*
+
+The chunk-specific hazard. **Run B** — same 1-Pod bypass, image/config as S but CPU tier shrunk to
+**256 MiB** (~9 F=16 blocks) to force eviction. Workload: a **shared, chunk-non-aligned prefix**
+(~600 tok, `% 256 = 88`, byte-identical via `PYTHONHASHSEED=0`) + per-request distinct ~600-tok suffix
+across 8 requests → the boundary chunk (tokens 512–767) straddles shared→unique, so each sibling's
+chunk-2 `BlockStored` re-announces the shared constituent block hashes. (Fully-aligned shared chunks 0/1
+dedupe by key and are *not* re-announced — confirmed.)
+
+- **Duplicate announcements observed on the wire:** `re_announced = 9` duplicate per-hash stores
+  (decoder checks 5/6); CPU removes arrive in whole-chunk groups `{16:1, 32:4}` (144 hashes). Shape
+  intact under overlap: all **18 CPU stores `n_hashes=16`**, zero placeholders (checks 1–2 PASS).
+- **Invariant held — a block is retained while a sibling chunk still references it:** the decoder's
+  `EventDedupFilter` simulation (ref-count per `(tier, hash)`, forward a remove only at refcount→0)
+  **suppressed 12 non-final removes**, forwarded 132 → `applied_removes == wire_removes − 12`. At the
+  producer, `removes-of-already-removed = 0` (check 5) — no erroneous double-remove.
+- **`BlockNotFound` / missing-parent / failed-apply / warning logs: `0`** — frontend
+  `kv_cache_events_applied` error buckets all `0` (block_not_found / parent_block_not_found /
+  invalid_block, across stored/removed/cleared); no apply errors in the frontend log.
+- **Apply stream reconciles after real `EventDedupFilter` semantics:** the live Dynamo worker-publisher
+  path (ai-dynamo/dynamo#8012) applied `stored ok = 34` (18 CPU + 16 GPU events) and
+  `removed ok = 114` (5 CPU + 109 GPU events) with **0 errors** — the duplicate announcements were
+  absorbed without any net over- or under-eviction. Offload real: `vllm:kv_offload_total_bytes_total
+  {GPU_to_CPU} = 504 MB` (8 ops) — exceeds the 256 MB tier, so CPU eviction genuinely occurred.
+
+> Granularity note: the decoder sim counts per **hash** (12 suppressed); the frontend counts per
+> **event** (114 removes applied). Both confirm the invariant — the sim proves the ref-count logic
+> suppresses non-final shared-hash removes, the frontend's all-zero error buckets prove the real path
+> applies cleanly with no premature-eviction fault.
+
+### 4.3 Edges / scope
+
+- **Trailing partial chunk** (prompt not a multiple of `F × block_size`) — **incidentally validated**:
+  S's ~2900-tok and A's ~16K-tok prompts are *not* 256-multiples, yet every CPU `BlockStored` carried
+  exactly `n_hashes=16` with **zero placeholders / zero partial (`n_hashes<16`) events**. The connector
+  offloads only *full* 256-token chunks (`num_offloadable_tokens // 256`); the partial tail stays in GPU
+  until it fills — no partial-chunk event, no error.
+- **Sliding-window groups** — **deferred / out of scope.** SWA groups keep the legacy placeholder
+  fallback; validating that a *mixed-attention* model doesn't emit self-describing for SWA groups needs
+  such a model (the validated Qwen3 is full-attention). Not exercised here; no regression risk for
+  full-attention models.
+- **`extra_keys`** (multimodal / cache-salt / prompt-embedding) — **out of scope.** The schema has room
+  but the path is untested here.
 
 ---
 
-## Appendix — Code-level reference: `Add` / 1:many / `Evict` / parent chaining
+## 5. Effectiveness & chunk↔block parity  *(the "overall" comparison)*
 
-### `Add` infers the mapping from the length ratio — this is the router-side 1:many
-```go
-// in_memory.go — Add()
-//   equal  (4 eng, 4 req) -> 1:1    E0->R0, E1->R1, ...
-//   many:1 (4 eng, 1 req) -> E0->R0, E1->R0, ...
-//   1:many (1 eng, 4 req) -> E0->[R0, R1, R2, R3]
-n := max(len(engineKeys), len(requestKeys))
-for i := 0; i < n; i++ {
-    ek := engineKeys[i*len(engineKeys)/n]
-    rk := requestKeys[i*len(requestKeys)/n]
-    newMappings[ek] = append(newMappings[ek], rk)
-}
-```
-For a Plan-A chunk event: `engineKeys = <1 tail hash>`, `requestKeys = <N token-derived keys>` → the
-`1:many` branch → `engineToRequestKeys[tail] = [r0…r_{N-1}]` (i.e. `E3 → [R0..R3]`), and all N request
-keys get the CPU `PodEntry` in `data`. Lookup walks the request keys (token-derived) only — so the
-chunk is invisible to matching; it looks like N ordinary blocks.
+Goal: chunk mode (`F=16`) keeps CPU-tier cache useful and routing quality ≈ by-block (`F=1`), at lower
+offload I/O. Run on the **NATS+etcd operator-free deploy, 4 workers, Qwen3-32B, 150 GiB CPU tier/worker**,
+driving the Stage-1 long-bench (`generate_multi_turn_longbench.json`, 128 conv · 15K prefix · 30–50 turns)
+via the vLLM multi-turn client (`-p 8 -k 32 --no-early-stop --seed 0`). **A** = F=16, **A′** = F=1 on the
+same image/workload/seed — a fresh same-image by-block baseline (Stage-1 §6 was vLLM 0.21; not reused).
+A/A′ are the **bounded `-n 600`** parity pair; a separate **clean full F=16 run** (`-n 2000`, **2000
+samples / 83 of 128 conversations complete / 0 failures**, fresh workers, baseline 0) provides the
+at-scale §5.1 reuse + §6 reconciliation numbers.
 
-### `Evict` is the symmetric 1:many — why Plan A needs no vLLM removal state
-```go
-// in_memory.go — Evict(), EngineKey case
-rks, _ := m.engineToRequestKeys.Get(key)   // = [r0…r_{N-1}]
-for _, rk := range rks {
-    m.evictPodsFromRequestKey(rk, key, entries, ...)   // drop the pod entry from ALL N
-}
-// when every rk is empty, drop the engineKey mapping too
-```
-One engine hash → all N canonical blocks evicted. That is why vLLM can send a single tail hash on
-removal and keep zero per-chunk state — the router's `E3 → [R0..R3]` does the fan-out. (Plans B/C move
-this fan-out to vLLM's `H3 → [H0..H3]` instead.)
+### 5.1 CPU-tier is useful at F=16  *(DONE 2026-06-26, PASS — clean full run)*
 
-### Parent chaining across chunks
-`GetRequestKey(engineKey)` returns `rks[len-1]` — the **last** request key of that engine hash. Chunk
-*c*'s `parent_block_hash` is chunk *c-1*'s tail engine hash, so it resolves to chunk *c-1*'s last
-block — the correct parent for chunk *c*'s first block — keeping the canonical keys contiguous.
+Under the 15K-prefix × 30–50-turn workload the GPU KV (108K tokens at `gpu-mem 0.5`) cannot hold the
+working set, so prefixes evict and the **CPU tier absorbs the reuse** (clean full F=16 run):
 
-### Why it's designed this way
-- **engineKey vs requestKey separation.** Request keys are canonical / content-addressed (from
-  tokens), so heterogeneous engines/backends with different internal hashing converge on **one**
-  matchable keyspace; the router matches on request keys, which any client can recompute.
-- **The ratio rule is generic, not chunk-specific.** The same code serves 1:1, many:1 (dedup), and
-  1:many. The indexer never has a "chunk" concept — a chunk is merely a 1:many ratio. This is the root
-  reason Plan A keeps chunking transparent to the index.
-- **`engineToRequestKeys` already earns its keep** for (a) location-only / device-tier updates, (b)
-  eviction, and (c) parent resolution. 1:many falls out of this existing structure rather than being a
-  new feature.
+- **External (CPU-tier) prefix-cache hit rate ≈ 78%** per worker (77.6 / 78.1 / 78.9 / 79.0%), vs GPU
+  prefix-cache only ~6% — i.e. **most prefix reuse is served from the CPU tier, not GPU**. Uniform
+  across all 4 workers (no single worker starves). The bounded A run agrees (per-worker ~73–81%).
+- **CPU→GPU reload real and large:** **~1.5–1.6 TB reloaded per worker** (`load_ops ~370–402`/worker,
+  vs a cold-start baseline of 0) against ~0.41 TB offloaded out — evicted prefixes are served back from
+  CPU on later turns, not recomputed.
+- Routing: the KV router keeps each conversation on the worker holding its CPU-tier prefix (the uniform
+  per-worker hit rates confirm even distribution).
 
-### Is the `engineKey → requestKey` mapping even necessary? (often it's identity)
-llm-d's `requestKey` is **built to reproduce vLLM's block hash**, not a separate scheme:
+### 5.2 Parity vs by-block  *(F=16 ↔ F=1, bounded A/A′, identical workload/seed)*
 
-- llm-d (`token_processor.go`): `requestKey = fnv64a(CBOR([parent, tokens, extra]))`, prefix-chained,
-  `initHash` seeded from `HashSeed`. Comments: *"mimics the chunkedTokenDatabase in the Python code,"*
-  *"compatibility with vLLM's prefix caching algorithm,"* `HashSeed` *"aligned with vLLM's
-  `PYTHONHASHSEED`."*
-- vLLM (`kv_cache_utils.py`): block hashes use CBOR-based functions (`sha256_cbor` / `xxhash_cbor`)
-  over `[parent, tokens, extra_keys]`, with `NONE_HASH` seeded from `PYTHONHASHSEED`.
+| metric | F=1 (A′, by-block) | F=16 (A, chunk) | note |
+|---|---|---|---|
+| samples / failures | 600 / 0 | 600 / 0 | both clean |
+| TTFT (ms, avg) | 425 | 426 | **parity** |
+| TPOT (ms, avg) | 21.1 | 21.0 | **parity** |
+| per-request latency (ms, avg) | 1459 | 1451 | **parity** |
+| input tokens (avg) | ~16.0K | ~16.0K | same workload |
+| **KV store events applied (frontend)** | **263,492** | **10,879** | **F=16 = ~24× fewer** |
+| KV removed events applied | 1,105,272 | 550,382 | F=16 ~2× fewer |
+| apply errors (block_not_found / invalid / parent) | **0** | **0** | clean reconciliation both |
+| CPU-tier prefix-cache hit rate | (workers torn down post-run; not captured) | ~77% | effectiveness shown on A (§5.1) |
 
-Same CBOR encoding of `[parent, tokens, extra]`, same prefix chain, same seed → **when the deployment
-aligns the hash function + seed, `requestKey == engineKey` per block.** (Byte-equality needs a matching
-function pair — vLLM `*_cbor` vs llm-d `fnv64a-cbor` — so it's a deployment-alignment requirement the
-llm-d config flags.)
+> The point is not "chunk is faster" — it's "chunk **preserves serving performance** (TTFT/TPOT/latency
+> all within noise) **while cutting the offload *store*-event volume ~24×**" (10.9K vs 263K store events).
+> Note the scope: the **removed**-event row is only ~2× fewer, so **total** applied KV events drop ~2.4×,
+> not 24× — the 24× is specifically the store-event row. Zero reconciliation errors at either factor. The
+> ~24× exceeds the naive 16× because by-block also re-announces each block on overlap/reuse, while chunk
+> mode batches `F` hashes per event.
+> **Honest gaps:** A′'s per-worker CPU-tier hit-rate and routing quality were **not captured** (workers
+> cleaned up before snapshot) — so for A′ only *serving-performance* parity (TTFT/TPOT/latency) is
+> measured; whether F=1 reuses the CPU tier comparably is **unmeasured** (matched latency is consistent
+> with it but does not prove it). Runs are bounded `-n 600` (≈600 turns / ~11–12 of 128 conversations),
+> not the full sweep; 4 workers, not 8.
 
-Consequences for the mapping:
+---
 
-| use | needs the mapping? |
-|---|---|
-| Lookup (match a new request) | **Never** — recompute the (identical) key from tokens, hit `data` directly. |
-| factor=1 removal (aligned) | **Redundant** — the engine hash *is* the request key; evict directly. |
-| **chunk removal (Plan A 1:many)** | **Necessary** — the tail engineKey equals only the last request key `R_{N-1}`; `R0…R_{N-2}` are distinct hashes you can't invert from the tail, and removal carries only the tail. |
-| heterogeneous / unaligned engines | **Necessary** — translates `engineKey ≠ requestKey`. |
+## 6. Conclusion
 
-So for plain aligned by-block the mapping is essentially **identity (redundant)**; it is load-bearing
-only for **Plan A's chunk removal** and **cross-engine translation**. Corollary: in `E3 → [R0,R1,R2,R3]`,
-alignment makes `R3 == E3`, so the mapping really just stores the `R0,R1,R2` the tail hash alone can't
-regenerate — which is exactly why a single-tail `BlockRemoved` needs it.
+Stage 2 self-describing contract is **validated at production `F=16`**:
+- **§4.1 shape + reconciliation** (run S): every CPU `BlockStored` carries `n_hashes=16` / `token_ids=256`,
+  zero placeholders; the frontend applied 100% of stored/removed events with **0 errors** — and the clean
+  full F=16 run reconciled **104K stored + 5.64M removed events at scale, still 0 errors**.
+- **§4.2 overlap / no premature eviction** (run B): non-aligned sibling chunks re-announce shared block
+  hashes (`re_announced > 0`); `EventDedupFilter` suppresses the non-final removes and the real Dynamo
+  path applies with **0 errors** — the duplicate hazard is absorbed, no over/under-eviction.
+- **§5 effectiveness + parity** (runs A / A′): chunk mode delivers **identical serving performance** to
+  by-block (TTFT/TPOT/latency within noise) while the CPU tier serves **~78% of prefix reuse** and the
+  **store-event volume drops ~24×** (10.9K vs 263K; the removed-event row is ~2× fewer, so *total* applied
+  KV events ≈2.4× fewer) — with **0 reconciliation errors at both factors**.
 
-### Dynamo side: what Plan A requires (code-located)
-Dynamo's KV router (`lib/kv-router`) has the same architecture as llm-d — a local hash computed from
-tokens (xxh3, `protocols.rs`) plus an external→local reverse map — but **both are 1:1 today**, so
-Plan A needs two changes.
+Net: the F=16 chunk contract is correct, the overlap hazard is handled, and chunk mode preserves routing
+quality + serving perf while cutting offload store-event volume ~24× (total KV events ~2.4×). **Scope
+caveats:** SWA groups keep the placeholder fallback (out of scope — needs a mixed-attention model);
+`extra_keys` (multimodal / cache-salt) untested; the A/A′ **parity** pair is bounded `-n 600`, the
+at-scale §5.1/§6 run completed **83/128 conv**, all on **4 workers** (not 8); **A′'s per-worker CPU-hit% /
+routing quality is unmeasured** (its workers were torn down before snapshot — only A′ serving-latency
+parity is measured; the clean full F=16 run supplies the F=16 per-worker CPU-hit). See §5.2 honest-gaps.
 
-**Current state:**
-- **Conversion is 1:1** (`zmq_wire/convert.rs`): `create_stored_blocks` is driven by
-  `block_hashes.len()` — `num_block_tokens = vec![block_size; block_hashes.len()]`, and the loop takes
-  `block_size` tokens **per external hash**, computing one local `tokens_hash` each. It does **not**
-  split by `len(token_ids)/block_size` the way llm-d's pool does.
-- **The external→local map is 1:1** (`indexer/concurrent_radix_tree.rs`):
-  `type WorkerLookup = FxHashMap<ExternalSequenceBlockHash, SharedBlock>` — one external hash → **one**
-  node, not a `Vec`. The radix tree's children are keyed by `tokens_hash` (local, prefix-chained);
-  `WorkerLookup` is the external→node reverse lookup used for O(1) removal (`apply_removed` removes one
-  node per external hash). This is the map "I remembered" — confirmed **1:1, not a list**.
+---
 
-**Changes needed for Plan A (mirror of llm-d's 1:many):**
-1. **Conversion 1:1 → 1:many** (`create_stored_blocks`): when the event is "1 tail hash + N·block_size
-   tokens, `block_size` = per-block size", drive the loop by **token length** (`len(token_ids) /
-   kv_block_size`), split the whole token stream into N canonical blocks, compute a prefix-chained
-   `tokens_hash` per block, and associate **all N** with the single external tail hash. (Today it
-   would take only the first `block_size` tokens → 1 block, mispair the tail hash with block 0's local
-   hash, and drop the rest.)
-2. **`WorkerLookup` 1:1 → 1:many**: `FxHashMap<ExternalSequenceBlockHash, SharedBlock>` →
-   `… Vec<SharedBlock>>` (or equivalent), so a single-tail `BlockRemoved` evicts all N nodes. **This is
-   the "is the local side a list?" question — currently no; Plan A needs it to be.**
+## Appendix — Validation run checklist
 
-**Two gotchas:**
-- `create_stored_blocks` breaks/skips when `num_tokens != kv_block_size` (`convert.rs`). Plan A's
-  `block_size` = per-block size = `kv_block_size`, so no conflict — but that logic currently means
-  "emit one block per hash", so the core edit is to make it slice by token length instead.
-- `apply_stored` warns `"block_hash mismatch: sequence hashes should be uniform across workers"`
-  (`concurrent_radix_tree.rs`): a given `tokens_hash` is expected to map to a consistent external hash.
-  Under chunk 1:many the same prefix could appear by-block (per-block hashes) on one path and chunked
-  (all tail hash) on another → may trip this; evaluate whether to relax it.
+Common: GPU block-size 16, ZMQ KV events, `self_describing_kv_events=true`. **Model:** A/A′/Full use
+`Qwen/Qwen3-32B` (`gpu_memory_utilization=0.50`); the S/B correctness runs use `Qwen3-0.6B` (event shape
+is model-independent). **Dropped** the unpatched/broken-router baseline (Stage-1 §6 owns it; #43468
+merged) and the self-describing-OFF A/B (redundant). **Main run mirrors Stage-1** (same long-bench
+workload + 150 GiB pool); only the overlap check uses a special shape.
 
-**llm-d ↔ Dynamo mapping of the change:** llm-d infers 1:many from the `len(eng):len(req)` ratio in
-`index.Add` + a one-to-many `engineToRequestKeys`; Dynamo needs the equivalent — slice by token length
-in `create_stored_blocks` + turn `WorkerLookup` into one-to-many.
+| run | F | workload | workers | CPU pool | proves | doc § |
+|---|---:|---|---|---|---|---|
+| **S** ✅ | 16 | 8 distinct ~2900-tok prompts (Qwen3-0.6B) | 1 | **2 GiB** (see sizing note) | F=16 event **shape** (n_hashes=16, token_ids=256, zero placeholder) + reconciliation — **DONE 2026-06-23, PASS** (88 CPU stores all n_hashes=16; applied 104 stored / 1196 removed, 0 errors) | 4.1 |
+| **B** ✅ | 16 | shared non-aligned prefix (~600 tok, `% 256 = 88`) + 8 distinct suffixes | 1 | **256 MiB** (forces eviction) | overlap / no premature eviction — **DONE 2026-06-23, PASS** (re_announced=9; sim suppressed=12 non-final removes; frontend 0 errors) | 4.2 |
+| **A** ✅ | 16 | **Stage-1 long-bench** (`generate_multi_turn_longbench.json`: 128 conv · 15 K conv-prefix · 30–50 turns), bounded `-n 600 -k 32` | **4** | 150 GiB | reconciliation-at-scale + CPU-tier effectiveness + perf — **DONE 2026-06-24, PASS** (CPU-hit ~77%; 10.9K stored evts / 0 err; TTFT 426/TPOT 21/lat 1451) | 4.1 / 5 |
+| **A′** ✅ | 1 | same as A (bounded `-n 600 -k 32`, same seed) | **4** | 150 GiB | same-image by-block parity baseline — **DONE 2026-06-24, PASS** (263K stored evts = 24× A / 0 err; TTFT 425/TPOT 21/lat 1459 = parity) | 5.2 |
+| **Full** ✅ | 16 | Stage-1 long-bench, `-n 2000 -k 32 --no-early-stop` (**83/128 conv, 2000 samples, 0 fail**) | **4** | 150 GiB | at-scale CPU-tier effectiveness + reconciliation — **DONE 2026-06-26, PASS** (CPU-hit ~78%; **104K stored + 5.64M removed evts / 0 err**; ~1.6 TB reload/worker) | 5.1 / 6 |
 
-### Dynamo side: implemented (what landed)
-Branch `feat/kv-router-chunked-offload-1many` (pushed to the fork). The 1→N expansion lives partly in
-the converter and partly in the index, mirroring llm-d.
+**Execution order (as run):** **S + B first** on the cheap 1-Pod bypass (§3a), **then A + A′ + the full
+at-scale F=16 run** on the NATS+etcd 4-worker deploy (§3b). **STATUS: all runs ✅ DONE + PASS** (S/B
+2026-06-23, A/A′ 2026-06-24, full F=16 2026-06-26). The multi-worker topology decision landed on **(b) NATS+etcd**
+(file-discovery doesn't span pods); 4 workers (not the originally-planned 8) — a de-risked first pass.
+CPU-tier sized at 150 GiB/worker (Qwen3-32B per-block ≈ 64 MB).
 
-**1. Converter fan-out** (`zmq_wire/convert.rs`). `create_stored_blocks` now detects a chunked event
-(`num_canonical = token_ids.len() / kv_block_size > block_hashes.len()`) and calls a new
-`create_stored_blocks_fanout`: it re-splits the whole token stream into `kv_block_size` blocks,
-computes each block's local `tokens_hash`, and maps **all of them to the single chunk-tail external
-hash** (ratio `block_hashes[i * m / num_canonical]`, identical to llm-d). The 1:1 path is untouched
-(normal events have one hash per block ⇒ `num_canonical == block_hashes.len()` ⇒ branch not taken).
+**Why A reuses Stage-1's workload, not a small one:** Stage-1 deliberately sized the workload large
+(15 K × ~40 turns → effective ISL 15–21 K) so the **GPU** KV (108 K tokens at `gpu-mem 0.5`) overflows
+→ real GPU eviction → offload to CPU + reload. A small workload would understate the effect. The 150 GiB
+CPU pool (~614 K tokens at ~64 MB/256-tok chunk) is *large enough to hold* what GPU evicts — so it's GPU
+pressure, not CPU-pool overflow, that drives the offload/reload observed in the full run (~0.41 TB out /
+~1.6 TB reloaded per worker; CPU-tier eviction is minimal). Reconciliation is read from the frontend
+`/metrics` `kv_cache_events_applied` counters (per-block event *shape* comes from the S/B ZMQ captures).
 
-**2. External→node lookup is now 1:many** in all three trees:
-- `radix_tree.rs` (single) and `concurrent_radix_tree.rs`: `Ext → node` → `Ext → Vec<node>`. Store
-  appends; parent resolution uses `.last()` (the chunk tail); a single-tail `BlockRemoved` drops
-  **all** nodes under that hash.
-- `concurrent_radix_tree_compressed`: `edge_index` already keeps the **last** position per hash
-  (right for lookup/parent), so only `remove_worker_for_hash` changed — it truncates coverage at the
-  **first** edge position carrying the hash, uncovering the whole chunk.
+**Why B is still separate:** the overlap hazard needs a **shared, chunk-non-aligned prefix across
+requests**; Stage-1's long-bench has *no* shared cross-conversation prefix (reuse is intra-conversation
+stickiness), so it cannot exercise sibling-chunk duplicates. B is a small single-worker correctness
+run with a shared `% 256 ≠ 0` prefix + eviction pressure.
 
-**3. 1:many-safe self-reference check.** The old "reuse-node-by-external-hash" trick (which also
-detected cycles) is incompatible with chunks (many blocks share a hash), so it was removed and
-replaced by an explicit check: reject a store only if a block's hash equals the event's `parent_hash`
-(a true cycle). Chunk blocks never trip this (their tail hash ≠ the previous chunk's tail).
+**Parity uses a fresh same-image F=1 run (A′), not Stage-1's published numbers.** Stage-1 §6 was
+vLLM 0.21; the stage2 image is 0.22.1rc + #43468, so reusing those numbers is version-mismatched.
+Ran **A′ = F=1 on the same stage2 image, same 4 workers, same workload + seed** as A — clean
+apples-to-apples (only the factor differs). Stage-1 §6 F=1 is at most a rough cross-check.
 
-**4. Safety guards for the unsupported cases** (chunked offload supports text / full-attention only):
-- **Non-full-attention** (sliding-window / SSM / mamba): already dropped by the normalizer/filter
-  (`is_main_attention`) before `convert_event` — no change needed.
-- **Multimodal (mm)**: the fan-out cannot distribute per-sub-block extra_keys, so a chunked event
-  carrying mm (`block_mm_infos`) is **dropped + warned** in `create_stored_blocks`. The 1:1 path still
-  handles mm correctly.
-- **`cache_salt` / `prompt_embeds`**: not visible to the router (discarded in deserialize), so they
-  cannot be guarded on the Dynamo side — must be handled vLLM-side.
+**Deploy used (multi-worker, no Grove):** option **(b) NATS + etcd + 4 worker Pods** (standard
+operator-free dynamo, closest to Stage-1) — see §3b for the full recipe + gotchas (HF-cache path/offline,
+300 Gi mem limit, 1-per-node anti-affinity). The shared-RWX-PVC file-discovery alternative (a) was not
+used. S/B stayed on the 1-Pod bypass (§3a).
 
-**Production path:** `convert_event` (`zmq_wire`) → `emit()` (`publisher/sinks.rs`) →
-`indexer.apply_event_with_buffer` → backend tree `apply_event` (→ `apply_stored` / `apply_removed`).
-
-**Validation:** a cross-impl Plan-A chunk test (`indexer/tests.rs`; runs on single / concurrent /
-compressed: 1 tail hash → all `factor` blocks matchable → single-tail remove evicts all) + an
-integration test driving the real converter + tree (`tests/chunk_plan_a.rs`); full suite **479 lib +
-2 integration tests green**. End-to-end on a real vLLM multi-turn capture with eviction: 328 CPU
-removes drop coverage 94.3% → 5.1% and contiguous 68 → 16 (the surviving 16 = the hot shared prefix),
-confirming chunk store **and** remove are applied.
+**Evidence per run:** Pod/manifest YAML + image digest; worker + frontend logs; frontend `/metrics`
+before/after; request + error counts. **S & B also:** ZMQ side-capture (`tcp://localhost:20080`)
+decoded with the step7 decoder (the per-block event-shape check); A/A′/Full reconciliation comes from
+the frontend `/metrics` counters + per-worker offload/prefix-cache metrics. **Pass criteria:** tables in
+§4.1 / §4.2 / §5 + zero lower-tier `BlockNotFound` / failed-apply / warnings.
